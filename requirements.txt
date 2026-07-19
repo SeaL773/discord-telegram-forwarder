@@ -1,0 +1,4 @@
+httpx>=0.28,<1
+websockets>=16,<17
+PyYAML>=6,<7
+loguru>=0.7,<1

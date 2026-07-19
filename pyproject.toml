@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord-tg-forwarder"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.28,<1", "websockets>=16,<17", "PyYAML>=6,<7", "loguru>=0.7,<1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.basedpyright]
+typeCheckingMode = "basic"
+stubPath = "typings"
