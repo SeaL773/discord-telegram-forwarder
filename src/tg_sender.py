@@ -37,20 +37,21 @@ class TokenBucket:
 
 
 class DualLimiter:
-    def __init__(self, global_bucket: TokenBucket, chat_capacity: float, sleep: Any = asyncio.sleep) -> None:
+    def __init__(self, global_bucket: TokenBucket, chat_refill_per_minute: float, sleep: Any = asyncio.sleep, chat_burst_capacity: float = 10) -> None:
         self.global_bucket = global_bucket
-        self.chat_capacity = chat_capacity
+        self.chat_refill_per_minute = chat_refill_per_minute
+        self.chat_burst_capacity = chat_burst_capacity
         self.chat_buckets: dict[str, TokenBucket] = {}
         self.sleep = sleep
         self.lock = asyncio.Lock()
 
     def chat_bucket(self, chat_id: str) -> TokenBucket:
         if chat_id not in self.chat_buckets:
-            self.chat_buckets[chat_id] = TokenBucket(self.chat_capacity, self.chat_capacity / 60, self.global_bucket.clock)
+            self.chat_buckets[chat_id] = TokenBucket(self.chat_burst_capacity, self.chat_refill_per_minute / 60, self.global_bucket.clock)
         return self.chat_buckets[chat_id]
 
     async def acquire(self, chat_id: str, cost: int) -> None:
-        if cost < 1 or cost > self.global_bucket.capacity or cost > self.chat_capacity:
+        if cost < 1 or cost > self.global_bucket.capacity or cost > self.chat_burst_capacity:
             raise ValueError("rate cost exceeds bucket capacity")
         async with self.lock:
             chat = self.chat_bucket(chat_id)
@@ -84,7 +85,7 @@ class TgSender:
         self.client = client
         self.state = state
         self.base_url = f"https://api.telegram.org/bot{token}"
-        self.limiter = DualLimiter(TokenBucket(global_per_s, global_per_s), chat_per_min, sleep)
+        self.limiter = DualLimiter(TokenBucket(max(10, global_per_s), global_per_s), chat_per_min, sleep)
         self.sleep = sleep
         self._attempt_lock = asyncio.Lock()
 
@@ -95,10 +96,13 @@ class TgSender:
         if inflight is None or inflight.get("cursor") != envelope.cursor:
             raise RuntimeError("in-flight cursor mismatch")
         records = inflight.get("targets", [])
+        normal_formatted = add_fallbacks(formatted, fallback_urls)
+        all_urls = attachment_urls if attachment_urls is not None else fallback_urls
+        fallback_formatted = add_fallbacks(formatted, all_urls)
         for index, target in enumerate(targets):
             if index < len(records) and records[index].get("status") != "pending":
                 continue
-            await self._send_target(index, envelope, target, add_fallbacks(formatted, fallback_urls), media, attachment_urls or fallback_urls)
+            await self._send_target(index, envelope, target, normal_formatted, fallback_formatted, media)
         await self.state.finish(envelope.cursor, "forwarded")
 
     async def send_alert(self, chat_id: str, text: str) -> bool:
@@ -119,11 +123,11 @@ class TgSender:
                 return False
             await self.sleep(2 ** (failures - 1))
 
-    async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, media: list[DownloadedMedia], attachment_urls: list[str]) -> None:
+    async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia]) -> None:
         target_state = self.state.in_flight["targets"][index] if self.state.in_flight else {}
         failures = int(target_state.get("retries", 0))
         if target_state.get("phase") == "fallback":
-            await self._send_fallback(index, envelope, target, add_fallbacks(formatted, attachment_urls))
+            await self._send_fallback(index, envelope, target, fallback_formatted)
             return
         batches = self._requests(target, formatted, media)
         media_delivery = bool(media)
@@ -143,7 +147,7 @@ class TgSender:
                         continue
                 if media_delivery:
                     await self.state.set_fallback(index)
-                    await self._send_fallback(index, envelope, target, add_fallbacks(formatted, attachment_urls))
+                    await self._send_fallback(index, envelope, target, fallback_formatted)
                 else:
                     await self.state.dead_letter({"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason})
                     await self.state.terminal(index, "dead_lettered")

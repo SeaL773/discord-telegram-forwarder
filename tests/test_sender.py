@@ -6,6 +6,7 @@ import httpx
 pytest = import_module("pytest")
 
 from src.formatter import format_event
+from src.main import pending_targets_are_fallback_only
 from src.models import Attachment, DownloadedMedia, Envelope, Target
 from src.state import StateStore
 from src.tg_sender import DualLimiter, TgSender, TokenBucket
@@ -20,8 +21,8 @@ async def test_token_bucket_waits():
         waits.append(value)
         now[0] += value
 
-    bucket = TokenBucket(1, 1, clock=lambda: now[0])
-    limiter = DualLimiter(bucket, 1, sleep=sleep)
+    bucket = TokenBucket(10, 10, clock=lambda: now[0])
+    limiter = DualLimiter(bucket, 1, sleep=sleep, chat_burst_capacity=1)
     await limiter.acquire("chat", 1)
     await limiter.acquire("chat", 1)
     assert waits == [60.0]
@@ -36,6 +37,40 @@ async def test_dual_limiter_does_not_consume_global_while_chat_waits():
     limiter.chat_bucket("a").tokens = 0
     await limiter.acquire("a", 1)
     assert global_bucket.tokens == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cost", [2, 10])
+async def test_low_refill_rates_accept_media_group_burst_without_changing_refill_rates(cost):
+    now = [0.0]
+    waits = []
+
+    async def sleep(value):
+        waits.append(value)
+        now[0] += value
+
+    global_bucket = TokenBucket(10, 1, clock=lambda: now[0])
+    limiter = DualLimiter(global_bucket, 1, sleep=sleep)
+    await limiter.acquire("chat", cost)
+    assert waits == []
+    assert global_bucket.refill_per_second == 1
+    assert limiter.chat_bucket("chat").refill_per_second == pytest.approx(1 / 60)
+    global_bucket.tokens = 0
+    limiter.chat_bucket("chat").tokens = 0
+    await limiter.acquire("chat", cost)
+    assert waits == [cost * 60.0]
+
+
+@pytest.mark.parametrize(
+    "targets,expected",
+    [
+        ([{"status": "pending", "phase": "fallback"}, {"status": "pending", "phase": "media"}], False),
+        ([{"status": "sent", "phase": "media"}, {"status": "pending", "phase": "media"}], False),
+        ([{"status": "sent", "phase": "media"}, {"status": "pending", "phase": "fallback"}], True),
+    ],
+)
+def test_recovery_download_skip_uses_only_pending_target_phases(targets, expected):
+    assert pending_targets_are_fallback_only({"cursor": "c", "targets": targets}, "c") is expected
 
 
 @pytest.mark.asyncio
@@ -125,16 +160,18 @@ async def test_ok_false_error_code_classification_and_alert_retry(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_media_400_switches_to_message_fallback(tmp_path: Path):
-    paths = []
+    requests = []
     def handler(request):
-        paths.append(request.url.path)
+        requests.append((request.url.path, request.content))
         return httpx.Response(400, json={"ok": False, "error_code": 400}) if request.url.path.endswith("sendPhoto") else httpx.Response(200, json={"ok": True})
     state = StateStore(tmp_path / "state", tmp_path / "dead")
     media = DownloadedMedia(Attachment("https://cdn.discordapp.com/x", "x.png"), b"x", "image/png", "photo")
     event = {"event_type": "CREATED", "message": {"content": "x"}}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await TgSender("token", client, state, 1000, 1000).send_event(Envelope("c", event), [Target("1")], format_event(event), [media], [], [media.attachment.url])
-    assert paths == ["/bottoken/sendPhoto", "/bottoken/sendMessage"] and state.ack == "c"
+        await TgSender("token", client, state, 1000, 1000).send_event(Envelope("c", event), [Target("1")], format_event(event), [media], [media.attachment.url], [media.attachment.url])
+    assert [path for path, _ in requests] == ["/bottoken/sendPhoto", "/bottoken/sendMessage"] and state.ack == "c"
+    assert requests[1][1].count(b"Attachment") == 1
+    assert requests[1][1].count(b"cdn.discordapp.com%2Fx") == 1
 
 
 @pytest.mark.asyncio
@@ -152,3 +189,88 @@ async def test_fallback_failure_deadletters_and_restart_resumes_without_media(tm
         await TgSender("token", client, restarted, 1000, 1000, sleep=no_sleep).send_event(envelope, [Target("1")], format_event(event), [], [], ["https://cdn.discordapp.com/x"])
     assert calls == ["/bottoken/sendMessage"] * 3
     assert restarted.ack == "c" and restarted.dead_letter_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_fallback_and_media_phases_per_target(tmp_path: Path):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    event = {"event_type": "CREATED", "message": {"content": "x"}}
+    envelope = Envelope("c", event)
+    targets = [Target("fallback"), Target("media")]
+    await state.begin(envelope, targets)
+    await state.set_fallback(0)
+    restarted = StateStore(state.path, state.dead_letter_path)
+    paths = []
+
+    def handler(request):
+        paths.append((request.url.path, request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    media = DownloadedMedia(Attachment("https://cdn.discordapp.com/x", "x.png"), b"image", "image/png", "photo")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, restarted, 1000, 1000).send_event(envelope, targets, format_event(event), [media], [], [media.attachment.url])
+    assert [path for path, _ in paths] == ["/bottoken/sendMessage", "/bottoken/sendPhoto"]
+    assert b"cdn.discordapp.com" in paths[0][1]
+    assert paths[0][1].count(b"Attachment") == 1
+    assert paths[0][1].count(b"cdn.discordapp.com%2Fx") == 1
+    assert b"image" in paths[1][1]
+    assert restarted.ack == "c"
+
+
+@pytest.mark.asyncio
+async def test_restart_ignores_sent_target_and_keeps_pending_media_delivery(tmp_path: Path):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    event = {"event_type": "CREATED", "message": {"content": "x"}}
+    envelope = Envelope("c", event)
+    targets = [Target("sent"), Target("media")]
+    await state.begin(envelope, targets)
+    await state.terminal(0, "sent")
+    restarted = StateStore(state.path, state.dead_letter_path)
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    media = DownloadedMedia(Attachment("https://cdn.discordapp.com/x", "x.png"), b"image", "image/png", "photo")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, restarted, 1000, 1000).send_event(envelope, targets, format_event(event), [media], [], [media.attachment.url])
+    assert paths == ["/bottoken/sendPhoto"]
+    assert restarted.ack == "c"
+
+
+@pytest.mark.asyncio
+async def test_failed_download_url_appears_once_during_normal_text_delivery(tmp_path: Path):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    event = {"event_type": "CREATED", "message": {"content": "x"}}
+    url = "https://cdn.discordapp.com/failed"
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, state, 1000, 1000).send_event(Envelope("c", event), [Target("1")], format_event(event), [], [url], [url])
+    assert len(bodies) == 1
+    assert bodies[0].count(b"Attachment") == 1
+    assert bodies[0].count(b"cdn.discordapp.com%2Ffailed") == 1
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_formats_persists_sends_and_acks(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    event = {"event_type": "CREATED", "message": {"content": "bad\ud800value"}}
+    formatted = format_event(event)
+    assert "bad�value" in formatted.text
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, state, 1000, 1000).send_event(Envelope("c", event), [Target("1")], formatted, [], [])
+    assert len(requests) == 1
+    assert b"bad%EF%BF%BDvalue" in requests[0].content
+    assert state.ack == "c"

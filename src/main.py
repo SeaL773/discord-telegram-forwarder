@@ -58,6 +58,13 @@ def frozen_targets(raw: list[dict[str, Any]]) -> tuple[Target, ...]:
     return tuple(Target(str(item["chat_id"]), item.get("thread_id")) for item in raw)
 
 
+def pending_targets_are_fallback_only(inflight: dict[str, Any] | None, cursor: str) -> bool:
+    if inflight is None or inflight.get("cursor") != cursor:
+        return False
+    pending_targets = [item for item in inflight.get("targets", []) if item.get("status") == "pending"]
+    return bool(pending_targets) and all(item.get("phase", "media") == "fallback" for item in pending_targets)
+
+
 async def run() -> None:
     LoggerManager.configure()
     config = load_config()
@@ -130,8 +137,7 @@ async def run() -> None:
                     formatted = format_event(work.envelope.event)
                     attachments = extract_attachments(work.envelope.event)
                     all_urls = [item.url for item in attachments]
-                    inflight = state.in_flight
-                    fallback_only = inflight is not None and inflight.get("cursor") == work.envelope.cursor and any(item.get("phase") == "fallback" for item in inflight["targets"])
+                    fallback_only = pending_targets_are_fallback_only(state.in_flight, work.envelope.cursor)
                     downloaded, failed = ([], all_urls) if fallback_only or not targets else await media.download_all(work.envelope.event)
                     await prepared_queue.put(PreparedEvent(work.envelope, targets, formatted, downloaded, failed, all_urls))
                 except BaseException:
