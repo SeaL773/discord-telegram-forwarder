@@ -159,6 +159,21 @@ async def test_ok_false_error_code_classification_and_alert_retry(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_alert_valid_429_is_bounded_to_three_total_attempts(tmp_path: Path):
+    attempts = 0
+    waits = []
+    async def sleep(value): waits.append(value)
+    def handler(_request):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 0.25}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sender = TgSender("token", client, StateStore(tmp_path / "state", tmp_path / "dead"), 1000, 1000, sleep=sleep)
+        assert not await sender.send_alert("1", "metadata")
+    assert attempts == 3 and waits == [0.25, 0.25]
+
+
+@pytest.mark.asyncio
 async def test_media_400_switches_to_message_fallback(tmp_path: Path):
     requests = []
     def handler(request):
@@ -172,6 +187,24 @@ async def test_media_400_switches_to_message_fallback(tmp_path: Path):
     assert [path for path, _ in requests] == ["/bottoken/sendPhoto", "/bottoken/sendMessage"] and state.ack == "c"
     assert requests[1][1].count(b"Attachment") == 1
     assert requests[1][1].count(b"cdn.discordapp.com%2Fx") == 1
+
+
+@pytest.mark.asyncio
+async def test_media_400_fallback_does_not_emit_invalid_attachment_href(tmp_path: Path):
+    requests = []
+    def handler(request):
+        requests.append((request.url.path, request.content))
+        return httpx.Response(400, json={"ok": False, "error_code": 400}) if request.url.path.endswith("sendPhoto") else httpx.Response(200, json={"ok": True})
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    media = DownloadedMedia(Attachment("https://cdn.discordapp.com/x", "x.png"), b"x", "image/png", "photo")
+    event = {"event_type": "CREATED", "message": {"content": "keep me"}}
+    invalid = "https://example.com/bad\nvalue"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, state, 1000, 1000).send_event(Envelope("c", event), [Target("1")], format_event(event), [media], [], [media.attachment.url, invalid])
+    assert [path for path, _ in requests] == ["/bottoken/sendPhoto", "/bottoken/sendMessage"]
+    assert b"keep+me" in requests[1][1]
+    assert requests[1][1].count(b"Attachment") == 2
+    assert b"bad%0Avalue" not in requests[1][1]
 
 
 @pytest.mark.asyncio
@@ -255,6 +288,16 @@ async def test_failed_download_url_appears_once_during_normal_text_delivery(tmp_
     assert len(bodies) == 1
     assert bodies[0].count(b"Attachment") == 1
     assert bodies[0].count(b"cdn.discordapp.com%2Ffailed") == 1
+
+
+def test_embed_media_is_compatible_with_downloaded_send_preparation(tmp_path: Path):
+    event = {"event_type": "CREATED", "message": {"content": "x", "embeds": [{"title": "Card"}]}}
+    media = DownloadedMedia(Attachment("https://pbs.twimg.com/media/card.jpg", "card.jpg"), b"img", "image/jpeg", "photo")
+    sender = TgSender("token", httpx.AsyncClient(), StateStore(tmp_path / "state", tmp_path / "dead"))
+    batch = sender._requests(Target("1"), format_event(event), [media])[0]
+    assert batch.method == "sendPhoto"
+    assert batch.data["caption"] == format_event(event).caption
+    assert batch.files == {"file0": ("card.jpg", b"img", "image/jpeg")}
 
 
 @pytest.mark.asyncio

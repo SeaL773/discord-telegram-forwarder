@@ -92,6 +92,7 @@ class TgSender:
     async def send_event(self, envelope: Envelope, targets: list[Target], formatted: FormattedMessage, media: list[DownloadedMedia], fallback_urls: list[str], attachment_urls: list[str] | None = None) -> None:
         if self.state.in_flight is None:
             await self.state.begin(envelope, targets)
+        await self.state.recover_target_dead_letters()
         inflight = self.state.in_flight
         if inflight is None or inflight.get("cursor") != envelope.cursor:
             raise RuntimeError("in-flight cursor mismatch")
@@ -109,19 +110,20 @@ class TgSender:
         target = Target(chat_id)
         batch = RequestBatch("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, None, 1)
         failures = 0
-        while True:
+        for attempt in range(3):
             result = await self._attempt(batch, target)
             if result.ok:
                 return True
             if result.retry_after is not None:
-                await self.sleep(result.retry_after)
+                if attempt < 2:
+                    await self.sleep(result.retry_after)
                 continue
             if not result.retryable:
                 return False
             failures += 1
-            if failures >= 3:
-                return False
-            await self.sleep(2 ** (failures - 1))
+            if attempt < 2:
+                await self.sleep(2 ** (failures - 1))
+        return False
 
     async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia]) -> None:
         target_state = self.state.in_flight["targets"][index] if self.state.in_flight else {}
@@ -149,8 +151,7 @@ class TgSender:
                     await self.state.set_fallback(index)
                     await self._send_fallback(index, envelope, target, fallback_formatted)
                 else:
-                    await self.state.dead_letter({"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason})
-                    await self.state.terminal(index, "dead_lettered")
+                    await self.state.dead_letter_target(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason})
                 return
         await self.state.terminal(index, "sent")
 
@@ -172,8 +173,7 @@ class TgSender:
                 if failures < 3:
                     await self.sleep(2 ** (failures - 1))
                     continue
-            await self.state.dead_letter({"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "phase": "fallback", "reason": result.reason})
-            await self.state.terminal(index, "dead_lettered")
+            await self.state.dead_letter_target(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "phase": "fallback", "reason": result.reason})
             return
 
     def _common(self, target: Target) -> dict[str, Any]:
