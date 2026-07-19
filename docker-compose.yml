@@ -1,0 +1,24 @@
+services:
+  forwarder:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - forwarder-data:/data
+      - ./config.yaml:/app/config.yaml:ro
+      - ./rules.yaml:/app/rules.yaml:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+volumes:
+  forwarder-data:
