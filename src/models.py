@@ -11,14 +11,13 @@ class Target:
 
     @property
     def key(self) -> str:
-        return f"{self.chat_id}:{self.thread_id or ''}"
+        return f"{self.chat_id}:{'' if self.thread_id is None else self.thread_id}"
 
 
 @dataclass(frozen=True, slots=True)
 class Envelope:
     cursor: str
     event: dict[str, Any]
-    force_drop: bool = False
 
     @classmethod
     def from_frame(cls, frame: dict[str, Any]) -> "Envelope":
@@ -41,6 +40,17 @@ class Envelope:
         ):
             raise ValueError("invalid event schema")
         return cls(frame["cursor"], event)
+
+
+class EventPreparationError(Exception):
+    """A deterministic event-data error that is safe to dead-letter and skip."""
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedEvent:
+    cursor: str
+    event: dict[str, Any]
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,5 +87,5 @@ class PreparedEvent:
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
-    envelope: Envelope
+    envelope: Envelope | RejectedEvent
     frozen_targets: tuple[Target, ...] | None = None

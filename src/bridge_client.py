@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import websockets
 
-from .models import Envelope
+from .models import Envelope, RejectedEvent
 from . import LoggerManager
 
 
@@ -47,52 +47,67 @@ class BridgeClient:
             raise SessionLost("invalid ready boundary")
         return cursor
 
-    async def _reader(self, ws: Any, queue: asyncio.Queue[dict[str, Any] | BaseException | None]) -> None:
+    @staticmethod
+    def _event_item(frame: Any) -> Envelope | RejectedEvent:
+        if not isinstance(frame, dict) or frame.get("type") != "event":
+            raise SessionLost("invalid bridge event frame")
+        cursor = frame.get("cursor")
+        event = frame.get("event")
+        if not isinstance(cursor, str) or not cursor or not isinstance(event, dict):
+            raise SessionLost("invalid bridge event frame")
+        try:
+            return Envelope.from_frame(frame)
+        except ValueError as exc:
+            return RejectedEvent(cursor, event, str(exc))
+
+    async def _reader(self, ws: Any, queue: asyncio.Queue[Envelope | RejectedEvent]) -> None:
         try:
             async for raw in ws:
                 try:
                     frame = json.loads(raw)
-                    if not isinstance(frame, dict) or frame.get("type") != "event":
-                        raise ValueError("invalid websocket frame")
-                    Envelope.from_frame(frame)
-                    await queue.put(frame)
-                except (json.JSONDecodeError, ValueError) as exc:
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
                     LoggerManager.log_error(f"bridge frame rejected error={type(exc).__name__}")
-                    await queue.put(SessionLost("invalid websocket event frame"))
-                    return
+                    raise SessionLost("invalid websocket event frame") from exc
+                await queue.put(self._event_item(frame))
         except websockets.ConnectionClosed:
             return
         finally:
             self.connected = False
-            await queue.put(None)
 
-    async def rest_pages(self, after: str | None, *, snapshot: bool = False) -> AsyncIterator[Envelope]:
+    async def rest_pages(self, after: str | None, *, snapshot: bool = False) -> AsyncIterator[Envelope | RejectedEvent]:
         cursor = after
+        visited = {cursor} if cursor is not None else set()
         while True:
             params: dict[str, Any] = {"limit": 500}
             if cursor is not None:
                 params["after"] = cursor
             response = await self.client.get(f"{self.base_url}/v1/events", headers=self.headers, params=params, timeout=30)
             if response.status_code == 409:
-                body = response.json()
-                raise CursorExpired(body.get("buffer_latest_cursor"))
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise SessionLost("invalid cursor-expired response") from exc
+                if not isinstance(body, dict):
+                    raise SessionLost("invalid cursor-expired response")
+                latest = body.get("buffer_latest_cursor")
+                if latest is not None and (not isinstance(latest, str) or not latest):
+                    raise SessionLost("invalid cursor-expired boundary")
+                raise CursorExpired(latest)
             response.raise_for_status()
-            body = response.json()
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise SessionLost("invalid REST replay JSON") from exc
             if not isinstance(body, dict) or not isinstance(body.get("events"), list) or not isinstance(body.get("has_more"), bool):
                 raise SessionLost("invalid REST replay page")
             for frame in body["events"]:
-                try:
-                    if not isinstance(frame, dict):
-                        raise ValueError("invalid REST frame")
-                    yield Envelope.from_frame(frame)
-                except ValueError as exc:
-                    LoggerManager.log_error(f"bridge frame rejected error={type(exc).__name__}")
-                    raise SessionLost("invalid REST event frame") from exc
+                yield self._event_item(frame)
             if snapshot or not body.get("has_more"):
                 return
             next_cursor = body.get("next_cursor")
-            if not isinstance(next_cursor, str) or next_cursor == cursor:
-                raise RuntimeError("invalid replay pagination")
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in visited:
+                raise SessionLost("invalid replay pagination")
+            visited.add(next_cursor)
             cursor = next_cursor
 
     async def bootstrap(self, ready_cursor: str | None, snapshot: Any) -> list[dict[str, Any]]:
@@ -105,18 +120,22 @@ class BridgeClient:
         keep: set[str] = set()
         by_channel: dict[str, list[Envelope]] = {}
         for envelope in events:
+            if isinstance(envelope, RejectedEvent):
+                continue
             if snapshot.route(envelope.event):
                 message = envelope.event.get("message", {})
                 channel = str(message.get("channel_id") or message.get("channelId") or "") if isinstance(message, dict) else ""
                 by_channel.setdefault(channel, []).append(envelope)
         for values in by_channel.values():
             keep.update(item.cursor for item in values[-10:])
-        return [{"cursor": item.cursor, "event": item.event, "targets": [{"chat_id": target.chat_id, "thread_id": target.thread_id} for target in snapshot.route(item.event)] if item.cursor in keep else []} for item in events]
+        return [{"cursor": item.cursor, "event": item.event, "targets": [{"chat_id": target.chat_id, "thread_id": target.thread_id} for target in snapshot.route(item.event)] if isinstance(item, Envelope) and item.cursor in keep else [], **({"rejection_reason": item.reason} if isinstance(item, RejectedEvent) else {})} for item in events]
 
-    async def capture_bootstrap(self, snapshot: Any) -> tuple[str | None, list[dict[str, Any]]]:
-        queue: asyncio.Queue[dict[str, Any] | BaseException | None] = asyncio.Queue(self.buffer_size)
-        async with self.connector(self.ws_url, additional_headers=self.headers, ping_timeout=45, max_queue=None, proxy=None) as ws:
+    async def capture_bootstrap(self, snapshot: Any, on_ready: Callable[[], None] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
+        queue: asyncio.Queue[Envelope | RejectedEvent] = asyncio.Queue(self.buffer_size)
+        async with self.connector(self.ws_url, additional_headers=self.headers, ping_timeout=45, max_queue=16, proxy=None) as ws:
             ready_cursor = self._parse_ready(await ws.recv())
+            if on_ready is not None:
+                on_ready()
             if ready_cursor is None:
                 return None, []
             self.connected = True
@@ -131,13 +150,29 @@ class BridgeClient:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
 
-    async def session(self, ack: str | None, _snapshot: Any, on_gap: Callable[[str | None], Awaitable[None]]) -> AsyncGenerator[Envelope, None]:
-        queue: asyncio.Queue[dict[str, Any] | BaseException | None] = asyncio.Queue(self.buffer_size)
-        async with self.connector(self.ws_url, additional_headers=self.headers, ping_timeout=45, max_queue=None, proxy=None) as ws:
+    async def _next_item(self, queue: asyncio.Queue[Envelope | RejectedEvent], reader: asyncio.Task[None]) -> Envelope | RejectedEvent:
+        while True:
+            if not queue.empty():
+                return queue.get_nowait()
+            if reader.done():
+                await reader
+                raise SessionLost("websocket disconnected")
+            get_task = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait((get_task, reader), return_when=asyncio.FIRST_COMPLETED)
+            if get_task in done:
+                return get_task.result()
+            get_task.cancel()
+            await asyncio.gather(get_task, return_exceptions=True)
+
+    async def session(self, ack: str | None, _snapshot: Any, on_gap: Callable[[str | None], Awaitable[None]], on_ready: Callable[[], None] | None = None) -> AsyncGenerator[Envelope | RejectedEvent, None]:
+        queue: asyncio.Queue[Envelope | RejectedEvent] = asyncio.Queue(self.buffer_size)
+        async with self.connector(self.ws_url, additional_headers=self.headers, ping_timeout=45, max_queue=16, proxy=None) as ws:
             ready_cursor = self._parse_ready(await ws.recv())
+            if on_ready is not None:
+                on_ready()
             self.connected = True
             reader = asyncio.create_task(self._reader(ws, queue))
-            replay: list[Envelope] = []
+            replay: list[Envelope | RejectedEvent] = []
             try:
                 try:
                     if ack == ready_cursor:
@@ -150,9 +185,7 @@ class BridgeClient:
                             raise SessionLost("REST replay missed ready boundary")
                 except CursorExpired:
                     await on_gap(ready_cursor)
-                    replay = []
-                if reader.done():
-                    raise SessionLost("websocket died during replay")
+                    raise SessionLost("restart after replay gap")
                 seen: set[str] = set()
                 seen_order: deque[str] = deque()
                 for envelope in replay:
@@ -163,12 +196,7 @@ class BridgeClient:
                     if ready_cursor is not None and envelope.cursor == ready_cursor:
                         break
                 while True:
-                    frame = await queue.get()
-                    if frame is None:
-                        raise SessionLost("websocket disconnected")
-                    if isinstance(frame, BaseException):
-                        raise frame
-                    envelope = Envelope.from_frame(frame)
+                    envelope = await self._next_item(queue, reader)
                     if envelope.cursor in seen:
                         continue
                     seen.add(envelope.cursor)
