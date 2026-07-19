@@ -5,9 +5,7 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
-      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
-      BRIDGE_TOKEN: ${BRIDGE_TOKEN:-}
+        format: raw
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
