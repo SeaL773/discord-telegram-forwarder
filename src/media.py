@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import socket
 from collections.abc import Awaitable, Callable, Iterable
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,23 +14,106 @@ import httpx
 from .models import Attachment, DownloadedMedia
 
 
-ALLOWED_MEDIA_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
+ALLOWED_MEDIA_HOSTS = {
+    "cdn.discordapp.com",
+    "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net",
+    "media.discordapp.net",
+    "pbs.twimg.com",
+}
+DISCORD_PROXY_HOSTS = {
+    "cdn.discordapp.com",
+    "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net",
+    "media.discordapp.net",
+}
+
+
+def _mapping_values(raw: Any) -> Iterable[Any]:
+    return raw.values() if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+
+
+def _valid_discord_proxy(url: Any) -> bool:
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname in DISCORD_PROXY_HOSTS
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        return False
+
+
+def _declared_size(item: dict[str, Any]) -> int | None:
+    size = item.get("size")
+    if not isinstance(size, (int, float)) or isinstance(size, bool) or not math.isfinite(size) or size < 0:
+        return None
+    return int(size)
+
+
+def _content_type(item: dict[str, Any]) -> str | None:
+    value = item.get("content_type") or item.get("contentType")
+    return str(value) if value else None
+
+
+def _embed_filename(item: dict[str, Any], url: str, embed_index: int, kind: str) -> str:
+    explicit = item.get("filename")
+    if explicit:
+        return str(explicit)
+    try:
+        name = PurePosixPath(urlsplit(url).path).name
+    except ValueError:
+        name = ""
+    return name or f"embed-{embed_index + 1}-{kind}"
 
 
 def extract_attachments(event: dict[str, Any]) -> list[Attachment]:
     message = event.get("message", {})
     message = message if isinstance(message, dict) else {}
     raw = message.get("attachments", event.get("attachments", []))
-    values: Iterable[Any] = raw.values() if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+    values = _mapping_values(raw)
     result: list[Attachment] = []
+    seen_urls: set[str] = set()
     for item in values:
         if not isinstance(item, dict):
             continue
         url = item.get("url") or item.get("proxy_url") or item.get("proxyUrl")
-        if not isinstance(url, str) or not url:
+        if not isinstance(url, str) or not url or url in seen_urls:
             continue
-        size = item.get("size")
-        result.append(Attachment(url, str(item.get("filename") or "attachment"), str(item.get("content_type") or item.get("contentType") or "") or None, int(size) if isinstance(size, (int, float)) else None))
+        seen_urls.add(url)
+        result.append(Attachment(url, str(item.get("filename") or "attachment"), _content_type(item), _declared_size(item)))
+
+    raw_embeds = message.get("embeds")
+    if isinstance(raw_embeds, list):
+        embeds = raw_embeds
+    elif isinstance(raw_embeds, dict):
+        embed_keys = {"author", "title", "description", "fields", "footer", "url", "image", "images", "thumbnail", "video", "provider", "type"}
+        embeds = [raw_embeds] if embed_keys.intersection(raw_embeds) else list(raw_embeds.values())
+    else:
+        embeds = []
+    for embed_index, raw_embed in enumerate(embeds[:10]):
+        if not isinstance(raw_embed, dict):
+            continue
+        raw_images = raw_embed.get("images")
+        images = raw_images if isinstance(raw_images, list) else list(raw_images.values()) if isinstance(raw_images, dict) else []
+        media_items = [("image", raw_embed.get("image"))]
+        media_items.extend((f"image-{index + 1}", item) for index, item in enumerate(images))
+        media_items.append(("thumbnail", raw_embed.get("thumbnail")))
+        for kind, item in media_items:
+            if not isinstance(item, dict):
+                continue
+            proxy_url = item.get("proxy_url") or item.get("proxyUrl")
+            source_url = item.get("url")
+            url = proxy_url if _valid_discord_proxy(proxy_url) else source_url
+            if not isinstance(url, str) or not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            result.append(Attachment(url, _embed_filename(item, url, embed_index, kind), _content_type(item), _declared_size(item)))
     return result
 
 

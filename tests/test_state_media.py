@@ -1,11 +1,12 @@
 import json
+import os
 from importlib import import_module
 from pathlib import Path
 
 import httpx
 pytest = import_module("pytest")
 
-from src.media import MediaHandler, extract_attachments
+from src.media import ALLOWED_MEDIA_HOSTS, MediaHandler, extract_attachments
 from src.models import Envelope, Target
 from src.state import StateStore
 
@@ -28,6 +29,174 @@ async def test_state_atomic_fanout_restart_and_dead_letter_order(tmp_path: Path)
     await restarted.finish("cursor", "forwarded")
     persisted = json.loads(restarted.path.read_text())
     assert persisted["last_acked_cursor"] == "cursor" and persisted["in_flight"] is None
+
+
+def target_dead_letter_record(cursor="cursor", chat_id="1"):
+    return {"cursor": cursor, "event": {"message": {"content": "payload"}}, "target": {"chat_id": chat_id, "thread_id": None}, "reason": "http_400"}
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_crash_before_append_keeps_target_pending(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    monkeypatch.setattr(state, "_append_dead_letter", lambda _record: (_ for _ in ()).throw(OSError("append failed")))
+    with pytest.raises(OSError, match="append failed"):
+        await state.dead_letter_target(0, target_dead_letter_record())
+    inflight = state.in_flight
+    assert inflight is not None and inflight["targets"][0]["status"] == "pending"
+    assert not state.dead_letter_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovers_after_append_before_terminal_without_duplicate(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1"), Target("2")])
+    original_persist = state._persist
+    monkeypatch.setattr(state, "_persist", lambda: (_ for _ in ()).throw(OSError("terminal persist failed")))
+    with pytest.raises(OSError, match="terminal persist failed"):
+        await state.dead_letter_target(0, target_dead_letter_record())
+    assert state.dead_letter_path.read_text().count("\n") == 1
+
+    monkeypatch.setattr(state, "_persist", original_persist)
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.recover_target_dead_letters()
+    inflight = restarted.in_flight
+    assert restarted.dead_letter_path.read_text().count("\n") == 1
+    assert inflight is not None and [target["status"] for target in inflight["targets"]] == ["dead_lettered", "pending"]
+    assert restarted.data["stats"]["dead_lettered"] == 1
+
+    again = StateStore(state.path, state.dead_letter_path)
+    await again.recover_target_dead_letters()
+    assert again.dead_letter_path.read_text().count("\n") == 1
+    assert again.data["stats"]["dead_lettered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_normal_transition_is_terminal_and_single_record(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1"), Target("2")])
+    await state.dead_letter_target(0, target_dead_letter_record())
+    record = json.loads(state.dead_letter_path.read_text().strip())
+    inflight = state.in_flight
+    assert record["dead_letter_id"] == "target:cursor:0:1:"
+    assert inflight is not None and [target["status"] for target in inflight["targets"]] == ["dead_lettered", "pending"]
+    assert state.dead_letter_path.read_text().count("\n") == 1
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovery_ignores_incomplete_crash_record(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    state.dead_letter_path.write_text('{"dead_letter_id":"incomplete', encoding="ascii")
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.recover_target_dead_letters()
+
+    inflight = restarted.in_flight
+    assert inflight is not None and inflight["targets"][0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovery_ignores_nested_identity_field(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    identity = state._target_dead_letter_id(0)
+    state.dead_letter_path.write_text(
+        json.dumps({"event": {"dead_letter_id": identity}, "reason": "prepare"}) + "\n",
+        encoding="ascii",
+    )
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.recover_target_dead_letters()
+
+    inflight = restarted.in_flight
+    assert inflight is not None and inflight["targets"][0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_partial_write_retry_is_separated_and_recoverable(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    original_write = os.write
+    calls = 0
+
+    def partial_then_raise(fd, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(fd, payload[:17])
+        raise OSError("crash during append")
+
+    monkeypatch.setattr(os, "write", partial_then_raise)
+    with pytest.raises(OSError, match="crash during append"):
+        await state.dead_letter_target(0, target_dead_letter_record())
+    monkeypatch.setattr(os, "write", original_write)
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.dead_letter_target(0, target_dead_letter_record())
+    lines = state.dead_letter_path.read_bytes().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[1])["dead_letter_id"] == "target:cursor:0:1:"
+
+    again = StateStore(state.path, state.dead_letter_path)
+    await again.recover_target_dead_letters()
+    assert again.data["stats"]["dead_lettered"] == 1
+    assert state.dead_letter_path.read_bytes().count(b"\n") == 2
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovery_tolerates_corrupt_bytes_huge_lines_and_chunk_boundaries(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1"), Target("2")])
+    first_id = b'target:cursor:0:1:'
+    second_id = b'target:cursor:1:2:'
+    valid_record = json.dumps({
+        "padding": "x" * (64 * 1024),
+        "dead_letter_id": first_id.decode(),
+    }, separators=(",", ":")).encode()
+    state.dead_letter_path.write_bytes(
+        b'\xff\xfe corrupt\n'
+        + b'z' * (2 * 64 * 1024) + b' malformed\n'
+        + b'not-json-prefix{"dead_letter_id":"' + first_id + b'"}\n'
+        + valid_record + b'\n'
+        + b'{"dead_letter_id":"' + second_id + b'"}'
+    )
+
+    await state.recover_target_dead_letters()
+    inflight = state.in_flight
+    assert inflight is not None
+    assert [target["status"] for target in inflight["targets"]] == ["dead_lettered", "pending"]
+    assert state.data["stats"]["dead_lettered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovery_scans_once_for_multiple_targets_and_is_idempotent(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1"), Target("2"), Target("3")])
+    records = [
+        {**target_dead_letter_record(chat_id="1"), "dead_letter_id": "target:cursor:0:1:"},
+        {**target_dead_letter_record(chat_id="3"), "dead_letter_id": "target:cursor:2:3:"},
+    ]
+    state.dead_letter_path.write_bytes(b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in records))
+    read_calls = 0
+    original_read = os.read
+
+    def counted_read(fd, size):
+        nonlocal read_calls
+        read_calls += 1
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", counted_read)
+    await state.recover_target_dead_letters()
+    first_read_calls = read_calls
+    await state.recover_target_dead_letters()
+
+    inflight = state.in_flight
+    assert inflight is not None
+    assert [target["status"] for target in inflight["targets"]] == ["dead_lettered", "pending", "dead_lettered"]
+    assert state.data["stats"]["dead_lettered"] == 2
+    assert read_calls == first_read_calls
+    assert state.dead_letter_path.read_bytes().count(b"\n") == 2
 
 
 @pytest.mark.asyncio
@@ -131,6 +300,172 @@ async def test_media_attachment_and_aggregate_limits_keep_small_multibatch():
     assert len(media) == 10 and len(failed) == 12
 
 
+def test_embed_media_preserves_attachments_deduplicates_and_prefers_safe_proxy():
+    attachment = "https://cdn.discordapp.com/attachments/a/original.png"
+    proxy = "https://images-ext-1.discordapp.net/external/hash/image.jpg"
+    gallery_proxy = "https://images-ext-2.discordapp.net/external/hash/gallery.jpg"
+    event = {"message": {
+        "attachments": [{"url": attachment, "filename": "original.png", "content_type": "image/png", "size": 7}],
+        "embeds": [{
+            "image": {"url": attachment, "proxy_url": "https://evil.example/proxy.png"},
+            "images": [
+                {"url": "https://pbs.twimg.com/media/gallery.jpg", "proxy_url": gallery_proxy, "content_type": "image/jpeg"},
+                {"url": attachment},
+            ],
+            "thumbnail": {"url": "https://pbs.twimg.com/media/source.jpg", "proxyUrl": proxy, "contentType": "image/jpeg", "size": 9},
+            "video": {"url": "https://cdn.discordapp.com/video.mp4"},
+        }],
+    }}
+    attachments = extract_attachments(event)
+    assert [(item.url, item.filename, item.content_type, item.declared_size) for item in attachments] == [
+        (attachment, "original.png", "image/png", 7),
+        (gallery_proxy, "gallery.jpg", "image/jpeg", None),
+        (proxy, "image.jpg", "image/jpeg", 9),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_embed_images_mapping_shape_preserves_order_and_global_media_cap():
+    gallery = {str(index): {"url": f"https://pbs.twimg.com/media/{index}.jpg"} for index in range(25)}
+    event = {"message": {
+        "attachments": [{"url": "https://cdn.discordapp.com/attachment.jpg"}],
+        "embeds": {"images": gallery, "thumbnail": {"url": "https://pbs.twimg.com/media/thumb.jpg"}},
+    }}
+    attachments = extract_attachments(event)
+    assert [item.url for item in attachments[:4]] == [
+        "https://cdn.discordapp.com/attachment.jpg",
+        "https://pbs.twimg.com/media/0.jpg",
+        "https://pbs.twimg.com/media/1.jpg",
+        "https://pbs.twimg.com/media/2.jpg",
+    ]
+    assert len(attachments) == 27
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"img")
+
+    async def resolver(_host): return ["8.8.8.8"]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloaded, failed = await MediaHandler(client, 20, 15, max_attachments=20, resolver=resolver).download_all(event)
+    assert len(downloaded) == 20
+    assert [item.attachment.url for item in downloaded] == [item.url for item in attachments[:20]]
+    assert failed == [item.url for item in attachments[20:]]
+    assert calls == [item.url for item in attachments[:20]]
+
+
+def test_embed_media_uses_source_when_proxy_host_is_not_explicitly_allowed():
+    source = "https://pbs.twimg.com/media/source.jpg"
+    attachments = extract_attachments({"message": {"embeds": {"image": {"url": source, "proxy_url": "https://example.com/proxy"}}}})
+    assert [item.url for item in attachments] == [source]
+    assert ALLOWED_MEDIA_HOSTS == {
+        "cdn.discordapp.com",
+        "images-ext-1.discordapp.net",
+        "images-ext-2.discordapp.net",
+        "media.discordapp.net",
+        "pbs.twimg.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_malformed_embed_url_falls_back_without_rejecting_event_or_other_media():
+    from src.formatter import add_fallbacks
+    from src.main import prepare_work
+    from src.models import PreparedEvent, WorkItem
+
+    bad = "https://["
+    good = "https://pbs.twimg.com/media/good.jpg"
+    event = {
+        "event_type": "CREATED",
+        "message": {
+            "content": "keep this text",
+            "embeds": [
+                {"image": {"url": bad}},
+                {"thumbnail": {"url": good}},
+            ],
+        },
+    }
+
+    class Router:
+        def route(self, event):
+            del event
+            return [Target("1")]
+
+    def handler(request):
+        assert str(request.url) == good
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"img")
+
+    async def resolver(_host): return ["8.8.8.8"]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        media = MediaHandler(client, 20, 15, resolver=resolver)
+        prepared = await prepare_work(WorkItem(Envelope("cursor", event)), Router(), media, None)
+
+    assert isinstance(prepared, PreparedEvent)
+    assert prepared.envelope.event == event
+    assert "keep this text" in prepared.formatted.text
+    assert [item.attachment.filename for item in prepared.media] == ["good.jpg"]
+    assert prepared.fallback_urls == [bad]
+    assert prepared.attachment_urls == [bad, good]
+    fallback = add_fallbacks(prepared.formatted, prepared.fallback_urls)
+    assert fallback.text.endswith("\nAttachment unavailable")
+
+
+def test_non_finite_or_negative_declared_media_size_is_ignored():
+    event = {"message": {"attachments": [
+        {"url": "https://cdn.discordapp.com/a", "size": float("inf")},
+        {"url": "https://cdn.discordapp.com/b", "size": float("nan")},
+        {"url": "https://cdn.discordapp.com/c", "size": -1},
+    ]}}
+    assert [item.declared_size for item in extract_attachments(event)] == [None, None, None]
+
+
+@pytest.mark.asyncio
+async def test_external_embed_hosts_download_or_fallback_exactly_once():
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"img")
+
+    async def resolver(_host): return ["8.8.8.8"]
+    accepted = [
+        "https://pbs.twimg.com/media/a.jpg",
+        "https://images-ext-2.discordapp.net/external/hash/b.jpg",
+    ]
+    rejected = "https://sub.pbs.twimg.com/media/c.jpg"
+    event = {"message": {"embeds": [
+        {"image": {"url": accepted[0]}},
+        {"thumbnail": {"url": accepted[1]}},
+        {"image": {"url": rejected}},
+        {"thumbnail": {"url": rejected}},
+    ]}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False) as client:
+        downloaded, failed = await MediaHandler(client, 20, 15, resolver=resolver).download_all(event)
+    assert [item.attachment.url for item in downloaded] == accepted
+    assert failed == [rejected]
+    assert calls == accepted
+
+
+@pytest.mark.asyncio
+async def test_embed_downloads_prepare_for_sender_and_failed_source_survives():
+    good = "https://pbs.twimg.com/media/good.jpg"
+    bad = "https://example.com/bad.jpg"
+
+    def handler(_request):
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=b"img")
+
+    async def resolver(_host): return ["8.8.8.8"]
+    event = {"message": {"embeds": [{"image": {"url": good}}, {"thumbnail": {"url": bad}}]}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloaded, failed = await MediaHandler(client, 20, 15, resolver=resolver).download_all(event)
+    assert len(downloaded) == 1 and downloaded[0].kind == "photo"
+    assert downloaded[0].attachment.filename == "good.jpg"
+    assert failed == [bad]
+
+
 def test_state_corruption_is_preserved_and_fails(tmp_path: Path):
     path = tmp_path / "state.json"
     path.write_text('{"version":1,"last_acked_cursor":7}')
@@ -171,6 +506,64 @@ async def test_bootstrap_plan_crash_restart_preserves_order_targets_and_index(tm
     await restarted.terminal(0, "sent")
     await restarted.finish("b", "forwarded")
     assert restarted.bootstrap is None and restarted.ack == "b"
+
+
+@pytest.mark.asyncio
+async def test_reject_event_deadletters_before_atomic_ack_and_advances_bootstrap(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    item = {"cursor": "bad", "event": {"schema_version": 2}, "targets": []}
+    await state.save_bootstrap("bad", [item])
+    await state.reject_event("bad", item["event"], "invalid event schema")
+    assert state.ack == "bad" and state.bootstrap is None
+    record = json.loads(state.dead_letter_path.read_text().strip())
+    assert record == {"cursor": "bad", "event": item["event"], "reason": "invalid event schema", "phase": "prepare"}
+
+    state = StateStore(tmp_path / "other-state.json", tmp_path / "other-dead.ndjson")
+    original = state._persist
+    async def fail_persist(): raise OSError("disk full")
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError):
+        await state.reject_event("retry", {"x": 1}, "bad")
+    assert state.ack is None
+    assert state.dead_letter_path.read_text().count("\n") == 1
+    monkeypatch.setattr(state, "_persist", original)
+    await state.reject_event("retry", {"x": 1}, "bad")
+    assert state.ack == "retry" and state.dead_letter_path.read_text().count("\n") == 2
+
+
+@pytest.mark.asyncio
+async def test_reject_event_requires_matching_inflight_or_bootstrap_cursor(tmp_path: Path):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    await state.begin(Envelope("current", {"x": 1}), [Target("1")])
+    with pytest.raises(RuntimeError):
+        await state.reject_event("other", {"x": 2}, "bad")
+    assert not state.dead_letter_path.exists() and state.ack is None
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_short_writes_are_completed_before_ack(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    original_write = __import__("os").write
+    writes = []
+
+    def short_write(fd, data):
+        chunk = data[:max(1, len(data) // 2)]
+        writes.append(len(chunk))
+        return original_write(fd, chunk)
+
+    monkeypatch.setattr("os.write", short_write)
+    await state.reject_event("cursor", {"value": "payload"}, "poison")
+    record = json.loads(state.dead_letter_path.read_text().strip())
+    assert record["cursor"] == "cursor" and state.ack == "cursor" and len(writes) > 1
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_zero_progress_does_not_advance_ack(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state", tmp_path / "dead")
+    monkeypatch.setattr("os.write", lambda _fd, _data: 0)
+    with pytest.raises(OSError, match="no progress"):
+        await state.reject_event("cursor", {"value": "payload"}, "poison")
+    assert state.ack is None
 
 
 @pytest.mark.asyncio

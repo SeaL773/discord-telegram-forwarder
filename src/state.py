@@ -13,6 +13,8 @@ from .models import Envelope, Target
 
 
 STAT_NAMES = {"forwarded", "dropped", "dead_lettered", "gaps"}
+DLQ_SCAN_CHUNK_SIZE = 64 * 1024
+DLQ_MAX_RECOVERY_RECORD_BYTES = 16 * 1024 * 1024
 DEFAULT_STATE: dict[str, Any] = {
     "version": 1,
     "last_acked_cursor": None,
@@ -27,6 +29,9 @@ class StateStore:
         self.path = path
         self.dead_letter_path = dead_letter_path
         self._lock = asyncio.Lock()
+        self._dead_letter_checked_ids: set[str] = set()
+        self._dead_letter_found_ids: set[str] = set()
+        self._dead_letter_scan_complete = False
         self.data = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -195,20 +200,172 @@ class StateStore:
             inflight = self.in_flight
             if inflight is not None and inflight["cursor"] != cursor:
                 raise RuntimeError("finish cursor does not match in-flight")
-            self.data["last_acked_cursor"] = cursor
-            self.data["in_flight"] = None
-            self.data["stats"][stat_name] += 1
+            self._advance(cursor, stat_name)
+            await self._persist()
+
+    def _advance(self, cursor: str, stat_name: str) -> None:
+        self.data["last_acked_cursor"] = cursor
+        self.data["in_flight"] = None
+        self.data["stats"][stat_name] += 1
+        bootstrap = self.bootstrap
+        if bootstrap is not None:
+            index = bootstrap["next_index"]
+            if index >= len(bootstrap["items"]) or bootstrap["items"][index]["cursor"] != cursor:
+                raise RuntimeError("bootstrap cursor order violation")
+            bootstrap["next_index"] = index + 1
+            if bootstrap["next_index"] == len(bootstrap["items"]):
+                if cursor != bootstrap["ready_cursor"]:
+                    raise RuntimeError("bootstrap did not finish at ready boundary")
+                self.data["bootstrap"] = None
+
+    def _append_dead_letter(self, record: dict[str, Any]) -> None:
+        self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.dead_letter_path.parent, 0o700)
+        flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.dead_letter_path, flags, 0o600)
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError("dead-letter path is not a regular file")
+            os.fchmod(fd, 0o600)
+            payload = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+            if file_stat.st_size and os.pread(fd, 1, file_stat.st_size - 1) != b"\n":
+                self._write_all(fd, b"\n")
+            self._write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._fsync_parent(self.dead_letter_path.parent)
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("dead-letter write made no progress")
+            remaining = remaining[written:]
+
+    def _dead_letter_ids(self, requested: set[str]) -> set[str]:
+        unchecked = requested - self._dead_letter_checked_ids
+        if not unchecked:
+            return requested & self._dead_letter_found_ids
+        if self._dead_letter_scan_complete or not self.dead_letter_path.exists():
+            self._dead_letter_checked_ids.update(unchecked)
+            self._dead_letter_scan_complete = True
+            return requested & self._dead_letter_found_ids
+        if self.dead_letter_path.is_symlink():
+            raise RuntimeError("dead-letter path must not be a symlink")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.dead_letter_path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("dead-letter path is not a regular file")
+            record = bytearray()
+            oversized = False
+            while chunk := os.read(fd, DLQ_SCAN_CHUNK_SIZE):
+                segments = chunk.split(b"\n")
+                for index, segment in enumerate(segments):
+                    if not oversized:
+                        if len(record) + len(segment) <= DLQ_MAX_RECOVERY_RECORD_BYTES:
+                            record.extend(segment)
+                        else:
+                            record.clear()
+                            oversized = True
+                    if index == len(segments) - 1:
+                        continue
+                    if not oversized:
+                        try:
+                            value = json.loads(record)
+                        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+                            pass
+                        else:
+                            identity = value.get("dead_letter_id") if isinstance(value, dict) else None
+                            if identity in unchecked:
+                                self._dead_letter_found_ids.add(identity)
+                    record.clear()
+                    oversized = False
+        finally:
+            os.close(fd)
+        self._dead_letter_checked_ids.update(unchecked)
+        self._dead_letter_scan_complete = True
+        return requested & self._dead_letter_found_ids
+
+    def _target_dead_letter_id(self, target_index: int) -> str:
+        inflight = self.in_flight
+        if inflight is None:
+            raise RuntimeError("no in-flight event")
+        target = self._target(target_index)
+        thread_id = target.get("thread_id")
+        return f"target:{inflight['cursor']}:{target_index}:{target['chat_id']}:{'' if thread_id is None else thread_id}"
+
+    async def dead_letter_target(self, target_index: int, record: dict[str, Any]) -> None:
+        async with self._lock:
+            target = self._target(target_index)
+            if target["status"] != "pending":
+                raise RuntimeError("target already terminal")
+            identity = self._target_dead_letter_id(target_index)
+            before = deepcopy(self.data)
+            if identity not in self._dead_letter_ids({identity}):
+                self._append_dead_letter({**record, "dead_letter_id": identity})
+                self._dead_letter_checked_ids.add(identity)
+                self._dead_letter_found_ids.add(identity)
+            try:
+                target["status"] = "dead_lettered"
+                self.data["stats"]["dead_lettered"] += 1
+                await self._persist()
+            except BaseException:
+                self.data = before
+                raise
+
+    async def recover_target_dead_letters(self) -> None:
+        async with self._lock:
+            inflight = self.in_flight
+            if inflight is None:
+                return
+            requested = {
+                self._target_dead_letter_id(index)
+                for index, target in enumerate(inflight["targets"])
+                if target["status"] == "pending"
+            }
+            identities = self._dead_letter_ids(requested)
+            before = deepcopy(self.data)
+            changed = False
+            for index, target in enumerate(inflight["targets"]):
+                if target["status"] == "pending" and self._target_dead_letter_id(index) in identities:
+                    target["status"] = "dead_lettered"
+                    self.data["stats"]["dead_lettered"] += 1
+                    changed = True
+            if not changed:
+                return
+            try:
+                await self._persist()
+            except BaseException:
+                self.data = before
+                raise
+
+    async def reject_event(self, cursor: str, event: dict[str, Any], reason: str) -> None:
+        async with self._lock:
+            inflight = self.in_flight
+            if inflight is not None and inflight["cursor"] != cursor:
+                raise RuntimeError("reject cursor does not match in-flight")
             bootstrap = self.bootstrap
             if bootstrap is not None:
                 index = bootstrap["next_index"]
                 if index >= len(bootstrap["items"]) or bootstrap["items"][index]["cursor"] != cursor:
                     raise RuntimeError("bootstrap cursor order violation")
-                bootstrap["next_index"] = index + 1
-                if bootstrap["next_index"] == len(bootstrap["items"]):
-                    if cursor != bootstrap["ready_cursor"]:
-                        raise RuntimeError("bootstrap did not finish at ready boundary")
-                    self.data["bootstrap"] = None
-            await self._persist()
+            before = deepcopy(self.data)
+            self._append_dead_letter({"cursor": cursor, "event": event, "reason": reason, "phase": "prepare"})
+            try:
+                self._advance(cursor, "dead_lettered")
+                await self._persist()
+            except BaseException:
+                self.data = before
+                raise
 
     async def gap_to(self, cursor: str | None) -> None:
         async with self._lock:
@@ -220,22 +377,6 @@ class StateStore:
 
     async def dead_letter(self, record: dict[str, Any]) -> None:
         async with self._lock:
-            self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self.dead_letter_path.parent, 0o700)
-            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(self.dead_letter_path, flags, 0o600)
-            try:
-                file_stat = os.fstat(fd)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    raise RuntimeError("dead-letter path is not a regular file")
-                os.fchmod(fd, 0o600)
-                payload = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
-                os.write(fd, payload)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            self._fsync_parent(self.dead_letter_path.parent)
+            self._append_dead_letter(record)
             self.data["stats"]["dead_lettered"] += 1
             await self._persist()
