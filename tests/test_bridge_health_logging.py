@@ -7,8 +7,8 @@ pytest = import_module("pytest")
 from src.LoggerManager import event_meta
 from src.bridge_client import BridgeClient, CursorExpired, SessionLost
 from src.health import HealthMonitor
-from src.models import Envelope, WorkItem
-from src.main import PendingCursors, wait_for_shutdown
+from src.models import Envelope, RejectedEvent, WorkItem
+from src.main import PendingCursors, ReconnectBackoff, wait_for_shutdown
 from src.router import parse_rules
 
 
@@ -67,6 +67,22 @@ async def test_bad_ws_event_is_epoch_fatal_and_later_good_event_not_emitted():
     ws = FakeWs([bad, frame("good")])
     async with httpx.AsyncClient() as client:
         bridge = BridgeClient("http://bridge", "token", client, connector=FakeConnect(ws))
+        stream = bridge.session("r2", parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
+        rejected = await anext(stream)
+        assert isinstance(rejected, RejectedEvent) and rejected.cursor == "bad"
+        assert (await anext(stream)).cursor == "good"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["{", "[]", json.dumps({"type": "event", "cursor": "", "event": {}}), json.dumps({"type": "event", "cursor": "c", "event": []})])
+async def test_invalid_ws_transport_frame_is_epoch_fatal(raw):
+    class RawWs(FakeWs):
+        async def __anext__(self):
+            if not self.frames:
+                await asyncio.Future()
+            return self.frames.pop(0)
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client, connector=FakeConnect(RawWs([raw])))
         stream = bridge.session("r2", parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
         with pytest.raises(SessionLost):
             await anext(stream)
@@ -129,7 +145,7 @@ async def test_normal_replay_and_bootstrap_require_ready_boundary():
 
 
 @pytest.mark.asyncio
-async def test_409_callback_runs_before_post_ready_ws():
+async def test_409_gap_discards_current_ws_epoch_after_callback():
     order = []
     ws = FakeWs([frame("live")])
     async with httpx.AsyncClient() as client:
@@ -142,10 +158,9 @@ async def test_409_callback_runs_before_post_ready_ws():
         async def gap(cursor): order.append(("gap", cursor))
         bridge.rest_pages = pages
         stream = bridge.session("expired", parse_rules({"rules": [], "default_action": "drop"}), gap)
-        item = await anext(stream)
-        order.append(("event", item.cursor))
-        await stream.aclose()
-    assert order == [("gap", "r2"), ("event", "live")]
+        with pytest.raises(SessionLost, match="restart after replay gap"):
+            await anext(stream)
+    assert order == [("gap", "r2")]
 
 
 @pytest.mark.asyncio
@@ -165,6 +180,61 @@ async def test_rest_after_pagination_and_409():
             [x async for x in bridge.rest_pages("expired")]
     assert requests[0] == {"limit": "500"}
     assert requests[1] == {"limit": "500", "after": "a"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    httpx.Response(409, text="not-json"),
+    httpx.Response(409, json={"buffer_latest_cursor": ""}),
+    httpx.Response(200, text="not-json"),
+    httpx.Response(200, json={"events": [], "next_cursor": "a", "has_more": True}),
+])
+async def test_rest_protocol_failures_are_normalized_to_session_lost(response):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: response)) as client:
+        bridge = BridgeClient("http://bridge", "token", client)
+        with pytest.raises(SessionLost):
+            [item async for item in bridge.rest_pages("a")]
+
+
+@pytest.mark.asyncio
+async def test_reader_completion_drains_buffer_then_reports_disconnect():
+    class ClosingWs(FakeWs):
+        async def __anext__(self):
+            if self.frames:
+                return json.dumps(self.frames.pop(0))
+            raise StopAsyncIteration
+    ws = ClosingWs([frame("one"), frame("two")])
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client, buffer_size=2, connector=FakeConnect(ws))
+        stream = bridge.session("r2", parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
+        assert [(await anext(stream)).cursor, (await anext(stream)).cursor] == ["one", "two"]
+        with pytest.raises(SessionLost, match="disconnected"):
+            await anext(stream)
+    assert bridge.connector.kwargs["max_queue"] == 16
+
+
+@pytest.mark.asyncio
+async def test_full_reader_queue_cancels_without_sentinel_deadlock():
+    ws = FakeWs([frame("one"), frame("two")])
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client, buffer_size=1)
+        queue = asyncio.Queue(maxsize=1)
+        reader = asyncio.create_task(bridge._reader(ws, queue))
+        await asyncio.sleep(0)
+        reader.cancel()
+        await asyncio.wait_for(asyncio.gather(reader, return_exceptions=True), 0.2)
+
+
+def test_ready_resets_reconnect_backoff_immediately_but_invalid_ready_does_not():
+    backoff = ReconnectBackoff(32)
+    backoff.failed(); backoff.failed()
+    assert backoff.delay == 4
+    with pytest.raises(SessionLost):
+        BridgeClient._parse_ready("{}")
+    assert backoff.delay == 4
+    assert BridgeClient._parse_ready(json.dumps({"type": "ready", "latest_cursor": "r"})) == "r"
+    backoff.ready()
+    assert backoff.delay == 1
 
 
 @pytest.mark.asyncio
@@ -205,6 +275,38 @@ async def test_health_threshold_one_alert_per_episode():
     assert "last_event_age_seconds" in payload
 
 
+@pytest.mark.asyncio
+async def test_connected_pipeline_stall_health_uses_durable_cursor_progress_and_outstanding_work():
+    now = [0.0]
+    cursor = ["a"]
+    queue_depth = [0]
+    inflight = [False]
+    alerts = []
+    async def alert(text): alerts.append(text); return True
+    health = HealthMonitor(lambda: True, lambda: cursor[0], lambda: queue_depth[0], lambda: inflight[0], alert, clock=lambda: now[0])
+
+    assert health.snapshot() == (200, {"status": "ok", "cursor": "a", "queue_depth": 0, "in_flight": False, "disconnect_seconds": 0.0, "last_event_age_seconds": None, "stall_seconds": 0.0, "reason": None})
+    now[0] = 1000
+    assert health.snapshot()[0] == 200
+
+    queue_depth[0] = 1
+    assert health.snapshot()[0] == 200
+    now[0] = 1299.999
+    assert health.snapshot()[0] == 200
+    now[0] = 1300
+    code, payload = health.snapshot()
+    assert code == 503 and payload["reason"] == "pipeline_stalled" and payload["stall_seconds"] == 300.0
+    await health.maybe_alert(); await health.maybe_alert()
+    assert alerts == ["Forwarding pipeline stalled with outstanding work and no durable cursor progress for at least 5 minutes"]
+
+    cursor[0] = "b"
+    assert health.snapshot()[0] == 200
+    now[0] = 1600
+    assert health.snapshot()[0] == 503
+    queue_depth[0] = 0
+    assert health.snapshot()[0] == 200
+
+
 def test_privacy_safe_log_metadata_only():
     event = {"event_type": "CREATED", "message": {"guild_id": "g", "channel_id": "c", "content": "PRIVATE", "attachments": [{"url": "https://secret/?token=x"}]}}
     result = event_meta("cursor-secret", event)
@@ -222,13 +324,16 @@ def test_cross_session_pending_cursor_only_queues_once_and_terminal_releases():
 
 @pytest.mark.asyncio
 async def test_worker_failure_marks_health_unhealthy_and_propagates():
-    async def alert(_text): return True
+    alerts = []
+    async def alert(text): alerts.append(text); return True
     health = HealthMonitor(lambda: True, lambda: None, lambda: 0, lambda: False, alert)
     stop = asyncio.Event()
     async def crash(): raise RuntimeError("boom")
     failure = await wait_for_shutdown(stop, [asyncio.create_task(crash())], health)
     assert isinstance(failure, RuntimeError)
     assert health.snapshot()[0] == 503
+    await health.maybe_alert()
+    assert alerts == ["Forwarding worker failed unexpectedly; the forwarding pipeline stopped"]
 
 
 @pytest.mark.asyncio

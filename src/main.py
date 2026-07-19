@@ -3,18 +3,18 @@ from __future__ import annotations
 import asyncio
 import random
 import signal
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import websockets
 
-from .LoggerManager import LoggerManager, event_meta, logger
+from .LoggerManager import LoggerManager, event_meta, log_error, logger
 from .bridge_client import BridgeClient, SessionLost
 from .config import load_config
 from .formatter import format_event
 from .health import HealthMonitor
 from .media import MediaHandler, extract_attachments
-from .models import Envelope, PreparedEvent, Target, WorkItem
+from .models import DownloadedMedia, Envelope, EventPreparationError, PreparedEvent, RejectedEvent, Target, WorkItem
 from .router import Router
 from .state import StateStore
 from .tg_sender import TgSender
@@ -33,9 +33,39 @@ class PendingCursors:
     def terminal(self, cursor: str) -> None:
         self._values.discard(cursor)
 
+    @property
+    def count(self) -> int:
+        return len(self._values)
+
     async def await_terminal(self, queue: asyncio.Queue[Any], stop: asyncio.Event) -> bool:
         await queue.join()
         return not stop.is_set()
+
+
+class ReconnectBackoff:
+    def __init__(self, maximum: float) -> None:
+        self.maximum = maximum
+        self.delay = 1.0
+
+    def ready(self) -> None:
+        self.delay = 1.0
+
+    def failed(self) -> float:
+        current = min(self.delay, self.maximum)
+        self.delay = min(self.delay * 2, self.maximum)
+        return current
+
+
+class EventRouter(Protocol):
+    def route(self, event: dict[str, Any]) -> list[Target]: ...
+
+
+class EventMedia(Protocol):
+    async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]: ...
+
+
+class AlertSender(Protocol):
+    async def send_alert(self, chat_id: str, text: str) -> bool: ...
 
 
 async def wait_for_shutdown(stop: asyncio.Event, tasks: list[asyncio.Task[None]], health: HealthMonitor) -> BaseException | None:
@@ -65,6 +95,32 @@ def pending_targets_are_fallback_only(inflight: dict[str, Any] | None, cursor: s
     return bool(pending_targets) and all(item.get("phase", "media") == "fallback" for item in pending_targets)
 
 
+async def prepare_work(work: WorkItem, router: EventRouter, media: EventMedia, inflight: dict[str, Any] | None) -> PreparedEvent | RejectedEvent:
+    envelope = work.envelope
+    if isinstance(envelope, RejectedEvent):
+        return envelope
+    targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(envelope.event)
+    formatted = format_event(envelope.event)
+    try:
+        attachments = extract_attachments(envelope.event)
+    except EventPreparationError as exc:
+        return RejectedEvent(envelope.cursor, envelope.event, str(exc))
+    all_urls = [item.url for item in attachments]
+    fallback_only = pending_targets_are_fallback_only(inflight, envelope.cursor)
+    downloaded, failed = ([], all_urls) if fallback_only or not targets else await media.download_all(envelope.event)
+    return PreparedEvent(envelope, targets, formatted, downloaded, failed, all_urls)
+
+
+async def persist_gap_and_alert(state: StateStore, sender: AlertSender, admin_chat_id: str, ready: str | None, alert_timeout_s: float = 30) -> None:
+    await state.gap_to(ready)
+    try:
+        await asyncio.wait_for(sender.send_alert(admin_chat_id, "Bridge replay gap detected; skipped to current boundary. Metadata only."), timeout=alert_timeout_s)
+    except TimeoutError:
+        log_error("bridge gap alert timed out")
+    except Exception as exc:
+        log_error(f"bridge gap alert failed error={type(exc).__name__}")
+
+
 async def run() -> None:
     LoggerManager.configure()
     config = load_config()
@@ -85,9 +141,9 @@ async def run() -> None:
         media = MediaHandler(media_http, config.media_max_bytes, config.media_timeout_s, config.media_max_attachments, config.media_max_total_bytes)
         sender = TgSender(config.tg_token, telegram_http, state, config.telegram_global_per_s, config.telegram_chat_per_min)
         work_queue: asyncio.Queue[WorkItem] = asyncio.Queue(config.queue_size)
-        prepared_queue: asyncio.Queue[PreparedEvent] = asyncio.Queue(config.prepared_queue_size)
+        prepared_queue: asyncio.Queue[PreparedEvent | RejectedEvent] = asyncio.Queue(config.prepared_queue_size)
         pending = PendingCursors()
-        health = HealthMonitor(lambda: bridge.connected, lambda: state.ack, work_queue.qsize, lambda: state.in_flight is not None, lambda text: sender.send_alert(config.admin_chat_id, text))
+        health = HealthMonitor(lambda: bridge.connected, lambda: state.ack, lambda: work_queue.qsize() + prepared_queue.qsize(), lambda: state.in_flight is not None, lambda text: sender.send_alert(config.admin_chat_id, text), outstanding=lambda: pending.count > 0 or state.in_flight is not None)
         server = await health.serve(config.health_host, config.health_port)
 
         async def enqueue(item: WorkItem) -> None:
@@ -101,45 +157,38 @@ async def run() -> None:
             bootstrap = state.bootstrap
             if bootstrap is not None:
                 for item in bootstrap["items"][bootstrap["next_index"] :]:
-                    await enqueue(WorkItem(Envelope(item["cursor"], item["event"]), frozen_targets(item["targets"])))
+                    envelope = RejectedEvent(item["cursor"], item["event"], item["rejection_reason"]) if isinstance(item.get("rejection_reason"), str) else Envelope(item["cursor"], item["event"])
+                    await enqueue(WorkItem(envelope, frozen_targets(item["targets"])))
 
         async def gap(ready: str | None) -> None:
-            await sender.send_alert(config.admin_chat_id, "Bridge replay gap detected; skipped to current boundary. Metadata only.")
-            await state.gap_to(ready)
+            await persist_gap_and_alert(state, sender, config.admin_chat_id, ready)
 
         async def consume() -> None:
             await enqueue_recovery()
-            backoff = 1.0
+            backoff = ReconnectBackoff(config.reconnect_max_backoff_s)
             while not stop.is_set():
                 try:
                     if not await pending.await_terminal(work_queue, stop):
                         return
                     if state.ack is None:
-                        ready, plan = await bridge.capture_bootstrap(router.snapshot)
+                        ready, plan = await bridge.capture_bootstrap(router.snapshot, backoff.ready)
                         if ready is not None:
                             await state.save_bootstrap(ready, plan)
                             for item in plan:
-                                await enqueue(WorkItem(Envelope(item["cursor"], item["event"]), frozen_targets(item["targets"])))
+                                envelope = RejectedEvent(item["cursor"], item["event"], item["rejection_reason"]) if isinstance(item.get("rejection_reason"), str) else Envelope(item["cursor"], item["event"])
+                                await enqueue(WorkItem(envelope, frozen_targets(item["targets"])))
                             continue
-                    async for envelope in bridge.session(state.ack, router.snapshot, gap):
+                    async for envelope in bridge.session(state.ack, router.snapshot, gap, backoff.ready):
                         health.event_received()
                         await enqueue(WorkItem(envelope))
-                    backoff = 1.0
                 except (OSError, httpx.HTTPError, websockets.WebSocketException, SessionLost):
-                    await asyncio.sleep(min(backoff, config.reconnect_max_backoff_s) + random.random())
-                    backoff = min(backoff * 2, config.reconnect_max_backoff_s)
+                    await asyncio.sleep(backoff.failed() + random.random())
 
         async def prepare() -> None:
             while not stop.is_set():
                 work = await work_queue.get()
                 try:
-                    targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(work.envelope.event)
-                    formatted = format_event(work.envelope.event)
-                    attachments = extract_attachments(work.envelope.event)
-                    all_urls = [item.url for item in attachments]
-                    fallback_only = pending_targets_are_fallback_only(state.in_flight, work.envelope.cursor)
-                    downloaded, failed = ([], all_urls) if fallback_only or not targets else await media.download_all(work.envelope.event)
-                    await prepared_queue.put(PreparedEvent(work.envelope, targets, formatted, downloaded, failed, all_urls))
+                    await prepared_queue.put(await prepare_work(work, router, media, state.in_flight))
                 except BaseException:
                     work_queue.task_done()
                     pending.terminal(work.envelope.cursor)
@@ -149,13 +198,18 @@ async def run() -> None:
             while not stop.is_set():
                 prepared = await prepared_queue.get()
                 try:
-                    if not prepared.targets:
+                    if isinstance(prepared, RejectedEvent):
+                        await state.reject_event(prepared.cursor, prepared.event, prepared.reason)
+                        logger.info(event_meta(prepared.cursor, prepared.event))
+                    elif not prepared.targets:
                         await state.finish(prepared.envelope.cursor, "dropped")
                     else:
                         await sender.send_event(prepared.envelope, prepared.targets, prepared.formatted, prepared.media, prepared.fallback_urls, prepared.attachment_urls)
-                    logger.info(event_meta(prepared.envelope.cursor, prepared.envelope.event))
+                    if isinstance(prepared, PreparedEvent):
+                        logger.info(event_meta(prepared.envelope.cursor, prepared.envelope.event))
                 finally:
-                    pending.terminal(prepared.envelope.cursor)
+                    cursor = prepared.cursor if isinstance(prepared, RejectedEvent) else prepared.envelope.cursor
+                    pending.terminal(cursor)
                     prepared_queue.task_done()
                     work_queue.task_done()
 
