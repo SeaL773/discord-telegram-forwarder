@@ -1,0 +1,20 @@
+bridge:
+  url: "http://host.docker.internal:17891"
+  reconnect_max_backoff_s: 60
+telegram:
+  rate_limit_global_per_s: 25
+  rate_limit_per_chat_per_min: 18
+  media_max_bytes: 20971520
+  media_download_timeout_s: 15
+  media_max_attachments: 20
+  media_max_total_bytes: 41943040
+state:
+  path: /data/state.json
+  dead_letter_path: /data/failed-events.ndjson
+rules_path: /app/rules.yaml
+health:
+  host: 127.0.0.1
+  port: 8080
+admin_chat_id: "<TELEGRAM_ADMIN_CHAT_ID>"
+queue_size: 10000
+prepared_queue_size: 4
