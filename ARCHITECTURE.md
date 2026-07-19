@@ -122,8 +122,9 @@ discord-message-bridge            Telegram Bot API
 
 - 事件图标: 🆕 CREATED / ✏️ EDITED / 🗑️ DELETED / 👻 GHOST_PINGED
 - EDITED 尽量展示 before → after(collector 的 NDJSON 里若含旧内容);DELETED 展示被删内容 —— 这正是用 MessageLogger 的价值。
-- 正文超长(TG caption 1024 / text 4096 限制)时截断加省略标记。
+- 正文超长时按 Telegram 的 UTF-16 code-unit 口径执行 caption 1024 / text 4096 截断,并保持 HTML 标签闭合。
 - 所有用户内容必须 HTML-escape,防止 TG parse 报错。
+- collector 未提供频道/服务器名称时使用对应 ID 展示;贴纸显示转义后的名称及 Discord CDN 链接,保持文本/链接降级语义。
 
 ### 4.4 MediaHandler — 媒体转发
 
@@ -135,7 +136,7 @@ discord-message-bridge            Telegram Bot API
 ### 4.5 TgSender — 发送队列与限流
 
 - 单 worker 从队列取任务发送(简单起见先不做并发,消息量大再优化)。
-- 令牌桶限流: 全局 ~30 msg/s,**单 chat ~20 msg/min**(TG 对群组的硬限制,这是最容易踩的坑)。
+- 令牌桶限流: 全局 ~30 msg/s,**单 chat ~20 msg/min**(TG 对群组的硬限制,这是最容易踩的坑);突发容量与持续 refill rate 分离,允许单个最多 10 项的媒体组,不抬高配置的持续速率。
 - 429 处理: 读取 `retry_after` 精确等待后重试。
 - 网络错误: 重试 3 次(指数退避),仍失败则记 `failed-events.ndjson` 死信文件 + 日志告警,然后**继续推进 cursor**(不让一条毒消息卡死整个流水线)。
 
