@@ -100,7 +100,7 @@ class StateStore:
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self.data, handle, ensure_ascii=False, separators=(",", ":"))
+                json.dump(self.data, handle, ensure_ascii=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(name, self.path)
@@ -231,7 +231,7 @@ class StateStore:
                 if not stat.S_ISREG(file_stat.st_mode):
                     raise RuntimeError("dead-letter path is not a regular file")
                 os.fchmod(fd, 0o600)
-                payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+                payload = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
                 os.write(fd, payload)
                 os.fsync(fd)
             finally:

@@ -31,6 +31,19 @@ async def test_state_atomic_fanout_restart_and_dead_letter_order(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_state_and_dead_letter_round_trip_unpaired_surrogate(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    event = {"message": {"content": "bad\ud800value"}}
+    await state.begin(Envelope("cursor", event), [Target("1")])
+    assert "\\ud800" in state.path.read_text(encoding="ascii")
+    restarted = StateStore(state.path, state.dead_letter_path)
+    inflight = restarted.in_flight
+    assert inflight is not None and inflight["event"] == event
+    await restarted.dead_letter({"cursor": "cursor", "event": event})
+    assert json.loads(restarted.dead_letter_path.read_text(encoding="ascii"))["event"] == event
+
+
+@pytest.mark.asyncio
 async def test_media_extract_mapping_limits_and_fallback():
     calls = []
 
