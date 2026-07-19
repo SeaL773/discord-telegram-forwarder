@@ -75,8 +75,19 @@ def _targets(value: Any) -> tuple[Target, ...]:
     result: list[Target] = []
     seen: set[str] = set()
     for entry in entries:
-        entry = {"chat_id": entry} if not isinstance(entry, dict) else entry
-        target = Target(str(entry["chat_id"]), int(entry["thread_id"]) if entry.get("thread_id") is not None else None)
+        if isinstance(entry, dict):
+            target_data = entry
+        elif isinstance(entry, (str, int)) and not isinstance(entry, bool):
+            target_data = {"chat_id": entry}
+        else:
+            raise ValueError("target must be a scalar or mapping")
+        chat_id = target_data.get("chat_id")
+        if not isinstance(chat_id, (str, int)) or isinstance(chat_id, bool) or not str(chat_id).strip():
+            raise ValueError("chat_id must be a nonempty scalar")
+        thread_id = target_data.get("thread_id")
+        if thread_id is not None and (not isinstance(thread_id, int) or isinstance(thread_id, bool) or thread_id < 0):
+            raise ValueError("thread_id must be a nonnegative integer")
+        target = Target(str(chat_id), thread_id)
         if target.key not in seen:
             seen.add(target.key)
             result.append(target)
@@ -137,7 +148,11 @@ def parse_rules(raw: Any) -> RuleSnapshot:
     if default == "drop":
         default_targets: tuple[Target, ...] = ()
     elif isinstance(default, dict):
-        default_targets = _targets(default.get("forward_to"))
+        if set(default) != {"forward_to"}:
+            raise ValueError("default forward must contain only forward_to")
+        default_targets = _targets(default["forward_to"])
+        if not default_targets:
+            raise ValueError("default forward must define targets")
     else:
         raise ValueError("default forward must define targets")
     return RuleSnapshot(tuple(parsed), default_targets)
