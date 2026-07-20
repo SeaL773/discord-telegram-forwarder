@@ -218,14 +218,23 @@ async def telegram_call(client: httpx.AsyncClient, method: str, data: dict[str, 
     if not token:
         raise RuntimeError("TG_BOT_TOKEN is required")
     for attempt in range(MAX_ATTEMPTS):
-        response = await client.post(f"https://api.telegram.org/bot{token}/{method}", data=data)
-        body = response.json()
-        if not isinstance(body, dict):
-            raise RuntimeError(f"{method} returned an invalid response")
-        if body.get("ok"):
-            return body.get("result")
-        if response.status_code == 429:
+        try:
+            response = await client.post(f"https://api.telegram.org/bot{token}/{method}", data=data)
+        except (httpx.TimeoutException, httpx.NetworkError):
+            if attempt == MAX_ATTEMPTS - 1:
+                break
+            await asyncio.sleep(2 ** attempt)
+            continue
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error_code = body.get("error_code") if isinstance(body, dict) else None
+        code = int(error_code) if isinstance(error_code, (int, float)) and not isinstance(error_code, bool) else response.status_code
+        if response.status_code == 429 or code == 429:
             try:
+                if not isinstance(body, dict):
+                    raise TypeError("missing Telegram error body")
                 retry_after = float(body["parameters"]["retry_after"])
                 if not math.isfinite(retry_after) or retry_after < 0:
                     raise ValueError("invalid retry delay")
@@ -234,10 +243,19 @@ async def telegram_call(client: httpx.AsyncClient, method: str, data: dict[str, 
             if attempt < MAX_ATTEMPTS - 1:
                 await asyncio.sleep(min(MAX_RETRY_AFTER_S, max(0, retry_after)))
                 continue
-        elif response.status_code >= 500 and attempt < MAX_ATTEMPTS - 1:
-            await asyncio.sleep(2 ** attempt)
-            continue
-        raise RuntimeError(f"{method} failed status={response.status_code} description={body.get('description')}")
+        elif response.status_code >= 500 or code >= 500:
+            if attempt < MAX_ATTEMPTS - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+        elif body is None:
+            raise RuntimeError(f"{method} returned invalid JSON status={response.status_code}")
+        elif response.status_code >= 400 or 400 <= code < 500:
+            raise RuntimeError(f"{method} failed status={response.status_code} code={code}")
+        elif isinstance(body, dict) and body.get("ok") is True:
+            return body.get("result")
+        else:
+            raise RuntimeError(f"{method} returned a malformed success status={response.status_code}")
+        raise RuntimeError(f"{method} failed status={response.status_code} code={code}")
     raise RuntimeError(f"{method} failed after {MAX_ATTEMPTS} attempts")
 
 

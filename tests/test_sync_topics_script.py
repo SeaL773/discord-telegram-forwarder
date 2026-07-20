@@ -177,3 +177,117 @@ async def test_local_telegram_retry_is_finite_and_caps_retry_after(monkeypatch):
         await module.telegram_call(Client(), "editForumTopic", {})
     assert attempts == module.MAX_ATTEMPTS
     assert waits == [module.MAX_RETRY_AFTER_S, module.MAX_RETRY_AFTER_S]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code,expected_wait", [(429, 0.25), (500, 1)])
+async def test_local_telegram_retries_json_error_codes_with_http_200(monkeypatch, error_code, expected_wait):
+    module = load_script()
+    waits = []
+    responses = [
+        httpx.Response(200, json={
+            "ok": False,
+            "error_code": error_code,
+            **({"parameters": {"retry_after": 0.25}} if error_code == 429 else {}),
+        }),
+        httpx.Response(200, json={"ok": True, "result": True}),
+    ]
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            return responses.pop(0)
+
+    async def sleep(value):
+        waits.append(value)
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "synthetic")
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    assert await module.telegram_call(Client(), "editForumTopic", {}) is True
+    assert waits == [expected_wait]
+
+
+@pytest.mark.asyncio
+async def test_local_telegram_retries_network_error_without_leaking_response(monkeypatch):
+    module = load_script()
+    waits = []
+    attempts = 0
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.NetworkError("offline")
+            return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def sleep(value):
+        waits.append(value)
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "synthetic")
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    assert await module.telegram_call(Client(), "editForumTopic", {}) is True
+    assert waits == [1]
+
+
+@pytest.mark.asyncio
+async def test_local_telegram_retries_non_json_http_5xx(monkeypatch):
+    module = load_script()
+    waits = []
+    attempts = 0
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(500, text="upstream unavailable")
+
+    async def sleep(value):
+        waits.append(value)
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "synthetic")
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    with pytest.raises(RuntimeError, match="status=500"):
+        await module.telegram_call(Client(), "editForumTopic", {})
+    assert attempts == module.MAX_ATTEMPTS
+    assert waits == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_local_telegram_error_omits_description_and_token(monkeypatch):
+    module = load_script()
+    secret_description = "private response details"
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            return httpx.Response(400, json={"ok": False, "error_code": 400, "description": secret_description})
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "synthetic-token")
+    with pytest.raises(RuntimeError) as raised:
+        await module.telegram_call(Client(), "editForumTopic", {})
+    error = str(raised.value)
+    assert secret_description not in error
+    assert "synthetic-token" not in error
+
+
+@pytest.mark.asyncio
+async def test_local_telegram_final_network_error_drops_token_bearing_exception_chain(monkeypatch):
+    module = load_script()
+    token = "synthetic-secret-token"
+    waits = []
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            request = httpx.Request("POST", f"https://api.telegram.org/bot{token}/editForumTopic")
+            raise httpx.NetworkError("offline", request=request)
+
+    async def sleep(value):
+        waits.append(value)
+
+    monkeypatch.setenv("TG_BOT_TOKEN", token)
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    with pytest.raises(RuntimeError) as raised:
+        await module.telegram_call(Client(), "editForumTopic", {})
+    assert token not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert waits == [1, 2]
