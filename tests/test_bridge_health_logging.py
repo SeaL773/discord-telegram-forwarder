@@ -5,7 +5,7 @@ import httpx
 pytest = import_module("pytest")
 
 from src.LoggerManager import event_meta
-from src.bridge_client import BridgeClient, CursorExpired, SessionLost
+from src.bridge_client import BridgeClient, CursorExpired, SessionLost, _EventQueue
 from src.health import HealthMonitor
 from src.models import Envelope, RejectedEvent, WorkItem
 from src.main import PendingCursors, ReconnectBackoff, wait_for_shutdown
@@ -223,6 +223,58 @@ async def test_full_reader_queue_cancels_without_sentinel_deadlock():
         await asyncio.sleep(0)
         reader.cancel()
         await asyncio.wait_for(asyncio.gather(reader, return_exceptions=True), 0.2)
+
+
+@pytest.mark.asyncio
+async def test_next_item_cancellation_does_not_leave_orphaned_queue_getter():
+    queue = _EventQueue()
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+    reader = asyncio.create_task(wait_forever())
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client)
+        pending = asyncio.create_task(bridge._next_item(queue, reader))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        item = Envelope("cursor", {"message": {}})
+        await queue.put(item)
+        assert queue.get_nowait() is item
+
+    reader.cancel()
+    await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_next_item_cancellation_restores_item_already_taken_by_getter():
+    class CancellingQueue(_EventQueue):
+        outer_task: asyncio.Task[Envelope | RejectedEvent] | None = None
+
+        async def get(self) -> Envelope | RejectedEvent:
+            item = await super().get()
+            assert self.outer_task is not None
+            self.outer_task.cancel()
+            return item
+
+    queue = CancellingQueue()
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+    reader = asyncio.create_task(wait_forever())
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client)
+        pending = asyncio.create_task(bridge._next_item(queue, reader))
+        queue.outer_task = pending
+        await asyncio.sleep(0)
+        item = Envelope("cursor", {"message": {}})
+        await queue.put(item)
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert queue.get_nowait() is item
+
+    reader.cancel()
+    await asyncio.gather(reader, return_exceptions=True)
 
 
 def test_ready_resets_reconnect_backoff_immediately_but_invalid_ready_does_not():

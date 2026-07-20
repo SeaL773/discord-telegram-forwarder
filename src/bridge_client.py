@@ -23,6 +23,13 @@ class SessionLost(Exception):
     pass
 
 
+class _EventQueue(asyncio.Queue[Envelope | RejectedEvent]):
+    _queue: deque[Envelope | RejectedEvent]
+
+    def restore_front(self, item: Envelope | RejectedEvent) -> None:
+        self._queue.appendleft(item)
+
+
 class BridgeClient:
     def __init__(self, base_url: str, token: str, client: httpx.AsyncClient, buffer_size: int = 10000, connector: Any = websockets.connect) -> None:
         self.base_url = base_url.rstrip("/")
@@ -150,7 +157,7 @@ class BridgeClient:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
 
-    async def _next_item(self, queue: asyncio.Queue[Envelope | RejectedEvent], reader: asyncio.Task[None]) -> Envelope | RejectedEvent:
+    async def _next_item(self, queue: _EventQueue, reader: asyncio.Task[None]) -> Envelope | RejectedEvent:
         while True:
             if not queue.empty():
                 return queue.get_nowait()
@@ -158,14 +165,21 @@ class BridgeClient:
                 await reader
                 raise SessionLost("websocket disconnected")
             get_task = asyncio.create_task(queue.get())
-            done, _ = await asyncio.wait((get_task, reader), return_when=asyncio.FIRST_COMPLETED)
-            if get_task in done:
-                return get_task.result()
-            get_task.cancel()
-            await asyncio.gather(get_task, return_exceptions=True)
+            try:
+                done, _ = await asyncio.wait((get_task, reader), return_when=asyncio.FIRST_COMPLETED)
+                if get_task in done:
+                    return get_task.result()
+            except asyncio.CancelledError:
+                if get_task.done() and not get_task.cancelled():
+                    queue.restore_front(get_task.result())
+                raise
+            finally:
+                if not get_task.done():
+                    get_task.cancel()
+                    await asyncio.gather(get_task, return_exceptions=True)
 
     async def session(self, ack: str | None, _snapshot: Any, on_gap: Callable[[str | None], Awaitable[None]], on_ready: Callable[[], None] | None = None) -> AsyncGenerator[Envelope | RejectedEvent, None]:
-        queue: asyncio.Queue[Envelope | RejectedEvent] = asyncio.Queue(self.buffer_size)
+        queue = _EventQueue(self.buffer_size)
         async with self.connector(self.ws_url, additional_headers=self.headers, ping_timeout=45, max_queue=16, proxy=None) as ws:
             ready_cursor = self._parse_ready(await ws.recv())
             if on_ready is not None:
