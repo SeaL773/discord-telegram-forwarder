@@ -22,6 +22,8 @@ def load_script():
 
 
 def configure_paths(module, tmp_path: Path) -> None:
+    setattr(module, "CHAT_ID", "-1000")
+    setattr(module, "GUILD_ID", "2000")
     module.LOCAL_DIR = tmp_path
     module.MAP_PATH = tmp_path / "topic-map.json"
     module.RULES_PATH = tmp_path / "rules.yaml"
@@ -30,6 +32,14 @@ def configure_paths(module, tmp_path: Path) -> None:
 
 def channel(channel_id="100", name="Alerts"):
     return {"id": channel_id, "name": name, "parent_name": "Market", "status": "ok"}
+
+
+def test_deployment_ids_are_required():
+    module = load_script()
+    setattr(module, "CHAT_ID", "")
+    setattr(module, "GUILD_ID", "")
+    with pytest.raises(RuntimeError, match="TG_FORUM_CHAT_ID"):
+        module.validate_deployment_ids()
 
 
 def test_rule_preferences_preserve_legacy_true_manual_false_and_safe_new_default(tmp_path: Path):

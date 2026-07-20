@@ -10,6 +10,8 @@ import yaml
 
 
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+DEFAULT_DEAD_LETTER_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_DEAD_LETTER_BACKUP_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,8 @@ class AppConfig:
     prepared_queue_size: int
     state_path: Path
     dead_letter_path: Path
+    dead_letter_max_bytes: int
+    dead_letter_backup_count: int
     rules_path: Path
     health_host: str
     health_port: int
@@ -44,6 +48,12 @@ def _expand(value: Any) -> Any:
     return value
 
 
+def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
@@ -53,6 +63,20 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     telegram = raw.get("telegram", {})
     state = raw.get("state", {})
     health = raw.get("health", {})
+    if not isinstance(state, dict):
+        raise ValueError("state must be a mapping")
+    dead_letter_max_bytes = _bounded_int(
+        state.get("dead_letter_max_bytes", DEFAULT_DEAD_LETTER_MAX_BYTES),
+        "state.dead_letter_max_bytes",
+        1024 * 1024,
+        1024 * 1024 * 1024,
+    )
+    dead_letter_backup_count = _bounded_int(
+        state.get("dead_letter_backup_count", DEFAULT_DEAD_LETTER_BACKUP_COUNT),
+        "state.dead_letter_backup_count",
+        1,
+        100,
+    )
     config = AppConfig(
         bridge_url=str(bridge.get("url", "http://host.docker.internal:17891")).rstrip("/"),
         reconnect_max_backoff_s=float(bridge.get("reconnect_max_backoff_s", 60)),
@@ -65,10 +89,12 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         prepared_queue_size=int(raw.get("prepared_queue_size", 4)),
         state_path=Path(state.get("path", "/data/state.json")),
         dead_letter_path=Path(state.get("dead_letter_path", "/data/failed-events.ndjson")),
+        dead_letter_max_bytes=dead_letter_max_bytes,
+        dead_letter_backup_count=dead_letter_backup_count,
         rules_path=Path(raw.get("rules_path", "/app/rules.yaml")),
         health_host=str(health.get("host", "127.0.0.1")),
         health_port=int(health.get("port", 8080)),
-        admin_chat_id=str(raw.get("admin_chat_id", "<TELEGRAM_ADMIN_CHAT_ID>")),
+        admin_chat_id=str(raw.get("admin_chat_id", "")),
         queue_size=int(raw.get("queue_size", 10000)),
         tg_token=os.environ.get("TG_BOT_TOKEN", ""),
         bridge_token=os.environ.get("BRIDGE_TOKEN", ""),
@@ -98,4 +124,6 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ValueError("health.port out of range")
     if config.queue_size > 1_000_000:
         raise ValueError("queue_size out of range")
+    if re.fullmatch(r"-?[1-9]\d*", config.admin_chat_id) is None:
+        raise ValueError("admin_chat_id must be a nonzero Telegram chat ID")
     return config

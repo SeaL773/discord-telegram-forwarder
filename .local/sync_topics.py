@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,8 @@ import httpx
 import yaml
 
 
-CHAT_ID = "<TELEGRAM_FORUM_CHAT_ID>"
-GUILD_ID = "<DISCORD_GUILD_ID>"
+CHAT_ID = os.environ.get("TG_FORUM_CHAT_ID", "")
+GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
 CATALOG_PATH = Path("/catalog.json")
 LOCAL_DIR = Path("/local")
 MAP_PATH = LOCAL_DIR / "topic-map.json"
@@ -21,6 +22,13 @@ RULES_PATH = LOCAL_DIR / "rules.yaml"
 PENDING_PATH = LOCAL_DIR / "topic-create-pending.json"
 MAX_RETRY_AFTER_S = 60.0
 MAX_ATTEMPTS = 3
+
+
+def validate_deployment_ids() -> None:
+    if re.fullmatch(r"-?[1-9]\d*", CHAT_ID) is None:
+        raise RuntimeError("TG_FORUM_CHAT_ID must be a nonzero Telegram chat ID")
+    if re.fullmatch(r"[1-9]\d*", GUILD_ID) is None:
+        raise RuntimeError("DISCORD_GUILD_ID must be a nonzero Discord guild ID")
 
 
 def read_regular_text(path: Path) -> str:
@@ -260,6 +268,7 @@ async def telegram_call(client: httpx.AsyncClient, method: str, data: dict[str, 
 
 
 async def main() -> None:
+    validate_deployment_ids()
     channels = load_catalog()
     mapping = load_mapping()
     recover_pending(mapping)

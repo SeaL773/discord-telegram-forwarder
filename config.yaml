@@ -11,10 +11,12 @@ telegram:
 state:
   path: /data/state.json
   dead_letter_path: /data/failed-events.ndjson
+  dead_letter_max_bytes: 33554432
+  dead_letter_backup_count: 2
 rules_path: /app/rules.yaml
 health:
   host: 127.0.0.1
   port: 8080
-admin_chat_id: "<TELEGRAM_ADMIN_CHAT_ID>"
+admin_chat_id: "${ADMIN_CHAT_ID}"
 queue_size: 10000
 prepared_queue_size: 4
