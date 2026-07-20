@@ -21,6 +21,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "stats": {name: 0 for name in sorted(STAT_NAMES)},
     "in_flight": None,
     "bootstrap": None,
+    "topic_states": {},
 }
 
 
@@ -43,6 +44,8 @@ class StateStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if "bootstrap" not in value:
                 value["bootstrap"] = None
+            if "topic_states" not in value:
+                value["topic_states"] = {}
             self._validate(value)
             os.chmod(self.path, 0o600)
             return value
@@ -97,6 +100,18 @@ class StateStore:
             for item in items:
                 if not isinstance(item, dict) or not isinstance(item.get("cursor"), str) or not isinstance(item.get("event"), dict) or not isinstance(item.get("targets"), list):
                     raise ValueError("invalid bootstrap item")
+        topic_states = value.get("topic_states")
+        if not isinstance(topic_states, dict):
+            raise ValueError("invalid topic states")
+        for key, enabled in topic_states.items():
+            if not isinstance(key, str) or not isinstance(enabled, bool):
+                raise ValueError("invalid topic state")
+            chat_id, separator, raw_thread_id = key.rpartition(":")
+            if not separator or not chat_id.strip() or chat_id != chat_id.strip() or not raw_thread_id.isdecimal():
+                raise ValueError("invalid topic state key")
+            thread_id = int(raw_thread_id)
+            if thread_id <= 1 or str(thread_id) != raw_thread_id:
+                raise ValueError("invalid topic state key")
 
     async def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -140,6 +155,21 @@ class StateStore:
     def bootstrap(self) -> dict[str, Any] | None:
         value = self.data.get("bootstrap")
         return value if isinstance(value, dict) else None
+
+    @property
+    def topic_states(self) -> dict[str, bool]:
+        return dict(self.data["topic_states"])
+
+    async def mark_topic_state(self, target: Target, enabled: object) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("topic state must be boolean")
+        if not target.chat_id.strip() or target.chat_id != target.chat_id.strip():
+            raise ValueError("topic target must have a nonempty chat ID")
+        if target.thread_id is None or target.thread_id <= 1:
+            raise ValueError("topic target must have a non-General thread")
+        async with self._lock:
+            self.data["topic_states"][target.key] = enabled
+            await self._persist()
 
     async def save_bootstrap(self, ready_cursor: str, items: list[dict[str, Any]]) -> None:
         async with self._lock:
