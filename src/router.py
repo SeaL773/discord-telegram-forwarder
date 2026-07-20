@@ -54,6 +54,8 @@ class Rule:
     match: dict[str, Any]
     targets: tuple[Target, ...]
     drop: bool
+    enabled: bool = True
+    channel_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +66,22 @@ class RuleSnapshot:
     def route(self, event: dict[str, Any]) -> list[Target]:
         for rule in self.rules:
             if _matches(rule.match, event):
-                return [] if rule.drop else list(rule.targets)
+                return [] if rule.drop or not rule.enabled else list(rule.targets)
         return list(self.default_targets)
+
+    def topic_states(self) -> dict[str, tuple[Target, bool]]:
+        result: dict[str, tuple[Target, bool]] = {}
+        for rule in self.rules:
+            for target in rule.targets:
+                if target.thread_id is None or target.thread_id <= 1:
+                    continue
+                previous = result.get(target.key)
+                enabled = rule.enabled or (previous[1] if previous is not None else False)
+                result[target.key] = (target, enabled)
+        for target in self.default_targets:
+            if target.thread_id is not None and target.thread_id > 1:
+                result[target.key] = (target, True)
+        return result
 
 
 def _targets(value: Any) -> tuple[Target, ...]:
@@ -82,7 +98,12 @@ def _targets(value: Any) -> tuple[Target, ...]:
         else:
             raise ValueError("target must be a scalar or mapping")
         chat_id = target_data.get("chat_id")
-        if not isinstance(chat_id, (str, int)) or isinstance(chat_id, bool) or not str(chat_id).strip():
+        if (
+            not isinstance(chat_id, (str, int))
+            or isinstance(chat_id, bool)
+            or not str(chat_id).strip()
+            or str(chat_id) != str(chat_id).strip()
+        ):
             raise ValueError("chat_id must be a nonempty scalar")
         thread_id = target_data.get("thread_id")
         if thread_id is not None and (not isinstance(thread_id, int) or isinstance(thread_id, bool) or thread_id < 0):
@@ -143,7 +164,13 @@ def parse_rules(raw: Any) -> RuleSnapshot:
             raise ValueError("drop and forward_to are mutually exclusive")
         if not drop and not targets:
             raise ValueError("forward rule has no targets")
-        parsed.append(Rule(str(item.get("name", "unnamed")), dict(match), targets, drop))
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be boolean")
+        channel_name = item.get("channel_name")
+        if "channel_name" in item and (not isinstance(channel_name, str) or not channel_name.strip()):
+            raise ValueError("channel_name must be a nonempty string")
+        parsed.append(Rule(str(item.get("name", "unnamed")), dict(match), targets, drop, enabled, channel_name))
     default = raw.get("default_action", "drop")
     if default == "drop":
         default_targets: tuple[Target, ...] = ()
@@ -165,6 +192,8 @@ class Router:
         self._mtime_ns = self.path.stat().st_mtime_ns
 
     def _read(self) -> RuleSnapshot:
+        if self.path.is_symlink() or not self.path.is_file():
+            raise OSError("rules path must be a regular file")
         return parse_rules(yaml.safe_load(self.path.read_text(encoding="utf-8")) or {})
 
     def reload_if_changed(self) -> bool:

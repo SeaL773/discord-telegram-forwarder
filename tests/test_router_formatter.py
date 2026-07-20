@@ -43,6 +43,8 @@ def test_router_invalid_hot_reload_keeps_old(tmp_path: Path):
     {"thread_id": 1},
     {"chat_id": ""},
     {"chat_id": "   "},
+    {"chat_id": " 1"},
+    {"chat_id": "1 "},
     {"chat_id": True},
     {"chat_id": 1.5},
     {"chat_id": float("nan")},
