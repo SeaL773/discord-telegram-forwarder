@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from .LoggerManager import log_error
 from .formatter import add_fallbacks
 from .models import DownloadedMedia, Envelope, FormattedMessage, Target
 from .state import StateStore
+
+
+MAX_RETRY_AFTER_S = 60.0
+TOPIC_SYNC_TIMEOUT_S = 60.0
 
 
 class TokenBucket:
@@ -124,6 +130,47 @@ class TgSender:
             if attempt < 2:
                 await self.sleep(2 ** (failures - 1))
         return False
+
+    async def sync_forum_topics(self, desired: dict[str, tuple[Target, bool]], timeout_s: float = TOPIC_SYNC_TIMEOUT_S) -> None:
+        try:
+            await asyncio.wait_for(self._sync_forum_topics(desired), timeout=timeout_s)
+        except TimeoutError:
+            log_error(f"forum topic sync timed out timeout_s={timeout_s}")
+
+    async def _sync_forum_topics(self, desired: dict[str, tuple[Target, bool]]) -> None:
+        for key, (target, enabled) in desired.items():
+            if target.thread_id is None or target.thread_id <= 1:
+                continue
+            previous = self.state.topic_states.get(key)
+            if previous is enabled:
+                continue
+            if previous is None and enabled:
+                await self.state.mark_topic_state(target, True)
+                continue
+            method = "reopenForumTopic" if enabled else "closeForumTopic"
+            batch = RequestBatch(method, {
+                "chat_id": target.chat_id,
+                "message_thread_id": str(target.thread_id),
+            }, None, 1)
+            result = ApiResult(False, reason="not_attempted")
+            failures = 0
+            for attempt in range(3):
+                result = await self._attempt(batch, target)
+                if result.ok:
+                    await self.state.mark_topic_state(target, enabled)
+                    break
+                if attempt == 2 or not result.retryable and result.retry_after is None:
+                    break
+                if result.retry_after is not None:
+                    await self.sleep(result.retry_after)
+                else:
+                    failures += 1
+                    await self.sleep(2 ** (failures - 1))
+            if not result.ok:
+                log_error(
+                    f"forum topic sync failed chat_id={target.chat_id} "
+                    f"thread_id={target.thread_id} desired_enabled={enabled} reason={result.reason}"
+                )
 
     async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia]) -> None:
         target_state = self.state.in_flight["targets"][index] if self.state.in_flight else {}
@@ -242,9 +289,11 @@ class TgSender:
                     if not isinstance(body, dict):
                         raise TypeError("missing Telegram error body")
                     retry_after = float(body["parameters"]["retry_after"])
+                    if not math.isfinite(retry_after) or retry_after < 0:
+                        raise ValueError("invalid retry delay")
                 except (ValueError, KeyError, TypeError):
                     return ApiResult(False, retryable=True, reason="malformed_429")
-                return ApiResult(False, retry_after=retry_after, reason="rate_limited")
+                return ApiResult(False, retry_after=min(retry_after, MAX_RETRY_AFTER_S), reason="rate_limited")
             if status >= 500 or code >= 500:
                 return ApiResult(False, retryable=True, reason=f"http_{code}")
             if status >= 400 or 400 <= code < 500:

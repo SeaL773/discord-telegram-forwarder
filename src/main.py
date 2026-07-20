@@ -145,6 +145,7 @@ async def run() -> None:
         pending = PendingCursors()
         health = HealthMonitor(lambda: bridge.connected, lambda: state.ack, lambda: work_queue.qsize() + prepared_queue.qsize(), lambda: state.in_flight is not None, lambda text: sender.send_alert(config.admin_chat_id, text), outstanding=lambda: pending.count > 0 or state.in_flight is not None)
         server = await health.serve(config.health_host, config.health_port)
+        await sender.sync_forum_topics(router.snapshot.topic_states())
 
         async def enqueue(item: WorkItem) -> None:
             if pending.add(item.envelope.cursor):
