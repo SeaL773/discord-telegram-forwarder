@@ -2,12 +2,18 @@
 
 Python 3.11+ Discord → Telegram forwarder consuming the loopback-only `discord-message-bridge` through Docker's `host.docker.internal:17891` gateway. It implements WS-first boundary reconciliation, durable at-least-once fanout, rule hot reload, media forwarding/fallback, rate limits, dead letters, and a minimal health server.
 
+For a complete collector → Bridge → Forwarder deployment runbook, see
+[`docs/installation.md`](docs/installation.md).
+
 ## Setup
 
+Docker Compose 2.24.0 or newer is required because `docker-compose.yml` uses the long-form `env_file.required` option.
+
 1. Keep Bridge bound to `127.0.0.1`. M0 was verified directly with Docker Desktop's `host.docker.internal`; no `netsh` portproxy or firewall change is currently required.
-2. Copy `.env.example` to `.env` and fill `TG_BOT_TOKEN` and `BRIDGE_TOKEN`. Never commit `.env`. Compose `env_file` preserves a single `$` literally here, so do not double it. After editing `.env`, run `docker compose up -d`; `docker restart` does not reload environment files.
-3. Replace placeholder IDs in `rules.yaml`. Rules are first-match-wins and default to drop.
-4. Run `docker compose up -d --build`.
+2. Copy `.env.example` to `.env` and fill `TG_BOT_TOKEN`, `BRIDGE_TOKEN`, and numeric `ADMIN_CHAT_ID`. Never commit `.env`. Compose `env_file` preserves a single `$` literally here, so do not double it. After editing `.env`, run `docker compose up -d`; `docker restart` does not reload environment files.
+3. `ADMIN_CHAT_ID` identifies the Telegram chat that receives metadata-only health and replay-gap alerts; it is required but is not embedded in tracked configuration.
+4. Replace placeholder IDs in `rules.yaml`. Rules are first-match-wins and default to drop.
+5. Run `docker compose up -d --build`.
 
 Bridge auth is sent only as an Authorization header. REST uses `after` and `limit=500`. No event body, attachment URL, token, Telegram response body, or auth header is logged.
 
@@ -30,7 +36,7 @@ The deployed override mounts `.local/rules.yaml` read-only into the container. E
 - Existing mapped channels retain their previous switch value. Legacy rules without `enabled` remain enabled. A newly discovered channel with no topic mapping defaults to disabled and does not create a Topic.
 - To opt into a new channel, first generate the disabled readable rule, set `enabled: true`, then rerun the helper so it creates the Topic and writes the target mapping.
 
-Refresh the catalog and private rules with the tracked helper after setting `CATALOG_PATH` to the collector's `channel-catalog.result.json`:
+Refresh the catalog and private rules with the tracked helper after setting `CATALOG_PATH` to the collector's `channel-catalog.result.json`. The helper reads `TG_FORUM_CHAT_ID` and `DISCORD_GUILD_ID` from `.env`; neither deployment ID is embedded in the tracked script.
 
 ```sh
 docker compose -f docker-compose.yml -f .local/compose.override.yaml build forwarder
@@ -51,7 +57,21 @@ Treat `.env`, `.local/rules.yaml`, `.local/topic-map.json`, and `.local/sync_top
 
 The client connects WS first, receives `ready`, starts its bounded reader, then reconciles REST from the durable cursor through that boundary. A WS failure during reconciliation discards that session replay. On expired cursor (409), it atomically clears in-flight state, increments the gap counter, and acknowledges the ready boundary before attempting a bounded best-effort metadata-only admin alert; it then discards that WS epoch and reconnects so buffered overlap cannot cross the gap boundary. Initial startup takes the newest 500-event snapshot, applies one rules snapshot, forwards only the newest ten matching events per actual channel, and explicitly processes other snapshot entries as drops. Schema-invalid events with a trustworthy cursor, plus explicitly classified deterministic attachment preparation failures, are durably dead-lettered and acknowledged in pipeline order; malformed transport frames without a trustworthy cursor still force a reconnect.
 
-State is one mode-0600 atomic `/data/state.json` in the private mode-0700 Compose volume. First-start bootstrap order, event payloads, exact frozen target/drop decisions, next index, ready boundary, in-flight target phase, retry counts, and successful synchronization states for currently managed Topics are durable. Topic-state pruning does not alter cursor, bootstrap, or in-flight recovery data. Recovery finishes persisted in-flight and bootstrap work before opening Bridge, so later rule changes cannot alter those already-frozen decisions; disabling a rule is not a retroactive cancellation of durable work. Target dead letters carry a stable identity: if a process stops after the dead-letter append is fsynced but before terminal state persistence, recovery marks that target terminal without resending or appending a duplicate record; other targets remain independent. This is a recoverable cross-file protocol, not a claim of atomicity across the state and dead-letter files. Dead letters contain sensitive recovery payloads, are mode 0600, require a retention policy, and must not be placed on a shared volume.
+State is one mode-0600 atomic `/data/state.json` in the private mode-0700 Compose volume. First-start bootstrap order, event payloads, exact frozen target/drop decisions, next index, ready boundary, in-flight target phase, retry counts, and successful synchronization states for currently managed Topics are durable. Topic-state pruning does not alter cursor, bootstrap, or in-flight recovery data. Recovery finishes persisted in-flight and bootstrap work before opening Bridge, so later rule changes cannot alter those already-frozen decisions; disabling a rule is not a retroactive cancellation of durable work. Target dead letters carry a stable identity: if a process stops after the dead-letter append is fsynced but before terminal state persistence, recovery scans the active dead-letter file and all retained rotations, marks that target terminal without resending or appending a duplicate record, and leaves other targets independent. This is a recoverable cross-file protocol, not a claim of atomicity across the state and dead-letter files.
+
+### Privacy and retention
+
+- `/data/state.json` can temporarily contain complete Discord event payloads for bootstrap and in-flight recovery, including messages that routing will ultimately drop.
+- `/data/failed-events.ndjson` contains complete failed events and Telegram destination IDs. Before an append would make the active file exceed `state.dead_letter_max_bytes`, the forwarder first writes and fsyncs that complete record to a same-directory `.pending` file, then shifts the active file to `.1` and older files through `.N`, and finally atomically promotes `.pending` to active. It retains exactly `state.dead_letter_backup_count` backups. Defaults are 32 MiB and two backups, so steady-state retained storage is at most three generations and approximately 96 MiB total; during an interrupted rotation one additional `.pending` generation can exist temporarily, and a single record larger than 32 MiB may make the newly created active file exceed that approximation because records are never silently truncated or redacted.
+- Rotation uses same-directory replace operations, mode-0600 files, parent-directory fsync, and regular-file/symlink checks. Startup recovery also scans and completes an interrupted `.pending` rotation. Identity scanning remains bounded even when a complete target record exceeds the normal recovery-line parser limit because target identities are serialized before the full payload.
+- There is intentionally no age-based deletion: expiring a rotated record by age could erase the stable identity still needed after a crash between dead-letter fsync and state persistence. Size/count retention is finite while preserving every identity that remains within the configured recovery window.
+- Disabling or removing a rule prevents future routing but does not retroactively erase durable state, dead letters, Telegram messages, Bridge replay memory, or collector NDJSON files.
+- Keep the `/data` volume private and exclude it, `.env`, `.local/rules.yaml`, `.local/topic-map.json`, catalog results, logs, and backups from source control and shared backup destinations.
+- Discord message content may include personal data and private attachment URLs. Operate this pipeline only for accounts, servers, channels, and Telegram destinations where you are authorized to collect and forward the data.
+
+Bootstrap and in-flight payloads remain in `state.json` until their ordered recovery step is durably completed. They are not minimized earlier because doing so would remove the frozen event/decision data required to preserve current ordered recovery semantics.
+
+Before publishing a fork, scan the complete Git history as well as the current tree. Numeric chat/channel/guild IDs are not authentication secrets, but they can identify private communities and should be replaced with synthetic examples. Earlier revisions of a privately deployed repository may still contain those identifiers after the current tree is sanitized; rewrite all affected refs or publish a clean history containing only the reviewed tree.
 
 Discord embed author/title/description/fields/footer/source links are included in escaped Telegram HTML. Media joins the attachment queue in deterministic `attachments → image → images[] → thumbnail` order, with duplicate URLs removed. Media is downloaded in an ordered prepare stage ahead of the rate-limited send/commit stage, using a bounded prepared queue. Only HTTPS port-443 URLs on the exact hosts `cdn.discordapp.com`, `media.discordapp.net`, `images-ext-1.discordapp.net`, `images-ext-2.discordapp.net`, and `pbs.twimg.com` are accepted; DNS must resolve only to public addresses and redirects are rejected. Bridge, Telegram, and media use separate clients with environment proxy trust disabled. Defaults cap each event at 20 media items, 20 MiB each, and 40 MiB aggregate. Telegram batches preserve order, and burst capacity permits one 2-10 item media group without changing configured sustained refill rates. A failed media target durably switches to a text notification containing fallbacks for all original media URLs; only well-formed HTTP(S) URLs with a host and no whitespace/control characters enter Telegram HTML `href`, while invalid or unsupported values become the fixed plain-text label `Attachment unavailable`. Formatter truncation reserves space for complete fallback entries at both Telegram limits. Recovery preserves each target's independent media/fallback phase. A crash after a partial media batch may duplicate an earlier batch on recovery; this is the intentional at-least-once duplicate window.
 
@@ -66,6 +86,20 @@ The Bridge replay buffer is separately bounded, normally at 10,000 events. If th
 Use Docker rather than system Python:
 
 ```sh
-docker run --rm -v "$PWD:/workspace:ro" python:3.12-slim sh -c 'cp -R /workspace /tmp/project && cd /tmp/project && pip install -r requirements-dev.txt && pytest -q && python -m compileall -q src tests'
+docker run --rm -v "$PWD:/workspace:ro" python:3.12-slim sh -c 'mkdir /tmp/project && cp -a /workspace/. /tmp/project/ && cd /tmp/project && pip install -r requirements-dev.txt && pytest -q && python -m compileall -q src tests .local/sync_topics.py'
 docker compose config
 ```
+
+## License and upstream boundary
+
+This forwarder is a separate process that communicates with `discord-message-bridge` over HTTP/WebSocket; it does not include Vencord or `MessageLoggerEnhanced` source code. It is released under the **MIT License** (see `LICENSE`). The upstream collector patch has separate GPL-3.0 obligations documented in the Bridge repository.
+
+## Public release checklist
+
+This working tree has been sanitized and the MIT license is in place. One blocker remains before the repository can be described as a complete open-source release:
+
+- [x] Add a repository `LICENSE` for the Forwarder code. **Done** — MIT License, Copyright (c) 2026 SeaL773.
+- [ ] **Blocker:** Remove deployment identifiers from every branch, tag, and other published Git ref, or create a new public repository from the sanitized current tree without the private history. Use `scripts/audit_history.py` with a caller-supplied denylist to verify all reachable refs are clean before publishing. See `docs/safe-public-release-workflow.md` for the recommended procedure.
+- [ ] Run a full-history secret scanner such as Gitleaks or TruffleHog after history cleanup; the reviewed history contained deployment identifiers but no recognized credential-shaped tokens.
+- [ ] Confirm `.env`, `.local/`, `/data`, catalog files, logs, backups, and Compose overrides are absent from the release and CI artifacts.
+- [ ] Re-run the test, compile, and Compose validation commands above from a clean checkout.
