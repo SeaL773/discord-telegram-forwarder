@@ -9,7 +9,7 @@ For a complete collector → Bridge → Forwarder deployment runbook, see
 
 Docker Compose 2.24.0 or newer is required because `docker-compose.yml` uses the long-form `env_file.required` option.
 
-1. Keep Bridge bound to `127.0.0.1`. M0 was verified directly with Docker Desktop's `host.docker.internal`; no `netsh` portproxy or firewall change is currently required.
+1. Keep Bridge bound to `127.0.0.1`. Docker Desktop exposes the host through `host.docker.internal`, so a `netsh` portproxy or firewall exception is normally unnecessary.
 2. Copy `.env.example` to `.env` and fill `TG_BOT_TOKEN`, `BRIDGE_TOKEN`, and numeric `ADMIN_CHAT_ID`. Never commit `.env`. Compose `env_file` preserves a single `$` literally here, so do not double it. After editing `.env`, run `docker compose up -d`; `docker restart` does not reload environment files.
 3. `ADMIN_CHAT_ID` identifies the Telegram chat that receives metadata-only health and replay-gap alerts; it is required but is not embedded in tracked configuration.
 4. Replace placeholder IDs in `rules.yaml`. Rules are first-match-wins and default to drop.
@@ -27,16 +27,16 @@ A rule uses `action: drop` or `forward_to`, which accepts one mapping/scalar or 
 
 Rules are trusted administrator input. Keyword candidate text is bounded to 4096 characters, but pathological regular expressions should still be avoided.
 
-### Private channel controls
+### Forum topic controls
 
-The deployed override mounts `.local/rules.yaml` read-only into the container. Each generated rule keeps its stable Discord channel ID and adds a readable `channel_name`; normally the only field to edit by hand is `enabled`.
+An optional deployment override can mount `.local/rules.yaml` read-only into the container. Each generated rule keeps its stable Discord channel ID and adds a readable `channel_name`; normally the only field to edit by hand is `enabled`.
 
 - Changing `enabled` is hot-reloaded within about one second and immediately changes routing.
 - Telegram `closeForumTopic` / `reopenForumTopic` synchronization is intentionally startup-only. After editing switches, restart with `docker compose -f docker-compose.yml -f .local/compose.override.yaml restart forwarder`.
 - Existing mapped channels retain their previous switch value. Legacy rules without `enabled` remain enabled. A newly discovered channel with no topic mapping defaults to disabled and does not create a Topic.
 - To opt into a new channel, first generate the disabled readable rule, set `enabled: true`, then rerun the helper so it creates the Topic and writes the target mapping.
 
-Refresh the catalog and private rules with the tracked helper after setting `CATALOG_PATH` to the collector's `channel-catalog.result.json`. The helper reads `TG_FORUM_CHAT_ID` and `DISCORD_GUILD_ID` from `.env`; neither deployment ID is embedded in the tracked script.
+Refresh the catalog and topic rules with the tracked helper after setting `CATALOG_PATH` to the collector's `channel-catalog.result.json`. The helper reads `TG_FORUM_CHAT_ID` and `DISCORD_GUILD_ID` from `.env`; neither deployment ID is embedded in the tracked script.
 
 ```sh
 docker compose -f docker-compose.yml -f .local/compose.override.yaml build forwarder
@@ -93,13 +93,3 @@ docker compose config
 ## License and upstream boundary
 
 This forwarder is a separate process that communicates with `discord-message-bridge` over HTTP/WebSocket; it does not include Vencord or `MessageLoggerEnhanced` source code. It is released under the **MIT License** (see `LICENSE`). The upstream collector patch has separate GPL-3.0 obligations documented in the Bridge repository.
-
-## Public release checklist
-
-This working tree has been sanitized and the MIT license is in place. One blocker remains before the repository can be described as a complete open-source release:
-
-- [x] Add a repository `LICENSE` for the Forwarder code. **Done** — MIT License, Copyright (c) 2026 SeaL773.
-- [ ] **Blocker:** Remove deployment identifiers from every branch, tag, and other published Git ref, or create a new public repository from the sanitized current tree without the private history. Use `scripts/audit_history.py` with a caller-supplied denylist to verify all reachable refs are clean before publishing. See `docs/safe-public-release-workflow.md` for the recommended procedure.
-- [ ] Run a full-history secret scanner such as Gitleaks or TruffleHog after history cleanup; the reviewed history contained deployment identifiers but no recognized credential-shaped tokens.
-- [ ] Confirm `.env`, `.local/`, `/data`, catalog files, logs, backups, and Compose overrides are absent from the release and CI artifacts.
-- [ ] Re-run the test, compile, and Compose validation commands above from a clean checkout.
