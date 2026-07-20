@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .venv/
-.local/
+.local/*
+!.local/sync_topics.py
 data/*
 !data/.gitkeep
