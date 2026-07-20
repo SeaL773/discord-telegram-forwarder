@@ -99,9 +99,9 @@ async def prepare_work(work: WorkItem, router: EventRouter, media: EventMedia, i
     envelope = work.envelope
     if isinstance(envelope, RejectedEvent):
         return envelope
-    targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(envelope.event)
-    formatted = format_event(envelope.event)
     try:
+        targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(envelope.event)
+        formatted = format_event(envelope.event)
         attachments = extract_attachments(envelope.event)
     except EventPreparationError as exc:
         return RejectedEvent(envelope.cursor, envelope.event, str(exc))

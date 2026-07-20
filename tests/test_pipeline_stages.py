@@ -2,6 +2,7 @@ import asyncio
 from importlib import import_module
 from typing import Any
 
+import httpx
 pytest = import_module("pytest")
 
 from src.main import persist_gap_and_alert, prepare_work
@@ -66,8 +67,73 @@ async def test_prepare_only_converts_explicit_deterministic_rejection():
         def route(self, event: dict[str, Any]) -> list[Target]:
             del event
             raise EventPreparationError("known bad event")
-    with pytest.raises(EventPreparationError, match="known bad event"):
-        await prepare_work(WorkItem(Envelope("c", {"event_type": "CREATED", "message": {}})), DeterministicRouter(), Media(), None)
+    deterministic = await prepare_work(WorkItem(Envelope("c", {"event_type": "CREATED", "message": {}})), DeterministicRouter(), Media(), None)
+    assert isinstance(deterministic, RejectedEvent)
+    assert deterministic.reason == "known bad event"
+
+
+@pytest.mark.asyncio
+async def test_prepare_converts_explicit_formatter_rejection_without_swallowing_other_errors(monkeypatch):
+    class Router:
+        def route(self, event: dict[str, Any]) -> list[Target]:
+            del event
+            return []
+    class Media:
+        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
+            del event
+            return [], []
+    envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
+    monkeypatch.setattr("src.main.format_event", lambda _event: (_ for _ in ()).throw(EventPreparationError("bad format")))
+    rejected = await prepare_work(WorkItem(envelope), Router(), Media(), None)
+    assert isinstance(rejected, RejectedEvent)
+    assert rejected.reason == "bad format"
+
+    monkeypatch.setattr("src.main.format_event", lambda _event: (_ for _ in ()).throw(RuntimeError("formatter bug")))
+    with pytest.raises(RuntimeError, match="formatter bug"):
+        await prepare_work(WorkItem(envelope), Router(), Media(), None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_extract_exception_classification_and_cancellation(monkeypatch):
+    class Router:
+        def route(self, event: dict[str, Any]) -> list[Target]:
+            del event
+            return []
+    class Media:
+        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
+            del event
+            return [], []
+    envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
+
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: (_ for _ in ()).throw(EventPreparationError("bad attachment")))
+    rejected = await prepare_work(WorkItem(envelope), Router(), Media(), None)
+    assert isinstance(rejected, RejectedEvent)
+    assert rejected.reason == "bad attachment"
+
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: (_ for _ in ()).throw(RuntimeError("extract bug")))
+    with pytest.raises(RuntimeError, match="extract bug"):
+        await prepare_work(WorkItem(envelope), Router(), Media(), None)
+
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: (_ for _ in ()).throw(asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await prepare_work(WorkItem(envelope), Router(), Media(), None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_does_not_dead_letter_transient_media_failure(monkeypatch):
+    class Router:
+        def route(self, event: dict[str, Any]) -> list[Target]:
+            del event
+            return [Target("1")]
+    class Media:
+        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
+            del event
+            request = httpx.Request("GET", "https://cdn.discordapp.com/file")
+            raise httpx.ConnectError("network unavailable", request=request)
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: [])
+    envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
+    with pytest.raises(httpx.ConnectError, match="network unavailable"):
+        await prepare_work(WorkItem(envelope), Router(), Media(), None)
 
 
 @pytest.mark.asyncio
