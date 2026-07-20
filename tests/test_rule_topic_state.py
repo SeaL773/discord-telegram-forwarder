@@ -6,18 +6,6 @@ from src.models import Target
 from src.router import parse_rules
 
 
-def rule_enabled(rule):
-    return getattr(rule, "enabled")
-
-
-def rule_channel_name(rule):
-    return getattr(rule, "channel_name")
-
-
-def snapshot_topic_states(snapshot):
-    return getattr(snapshot, "topic_states")()
-
-
 def test_rule_defaults_enabled_and_retains_channel_name():
     snapshot = parse_rules({
         "rules": [{
@@ -30,8 +18,8 @@ def test_rule_defaults_enabled_and_retains_channel_name():
     })
 
     rule = snapshot.rules[0]
-    assert rule_enabled(rule) is True
-    assert rule_channel_name(rule) == "Market Alerts"
+    assert rule.enabled is True
+    assert rule.channel_name == "Market Alerts"
 
 
 def test_disabled_matching_rule_is_first_match_terminal_drop():
@@ -98,7 +86,7 @@ def test_rule_snapshot_topic_states_aggregate_shared_targets_with_or_semantics()
         "default_action": "drop",
     })
 
-    assert snapshot_topic_states(snapshot) == {
+    assert snapshot.topic_states() == {
         shared.key: (shared, True),
         enabled_only.key: (enabled_only, True),
         disabled_only.key: (disabled_only, False),
@@ -112,4 +100,4 @@ def test_default_forward_target_reopens_topic_closed_by_removed_rule():
         "default_action": {"forward_to": {"chat_id": topic.chat_id, "thread_id": topic.thread_id}},
     })
 
-    assert snapshot_topic_states(snapshot) == {topic.key: (topic, True)}
+    assert snapshot.topic_states() == {topic.key: (topic, True)}
