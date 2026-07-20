@@ -11,18 +11,6 @@ from src.state import StateStore
 from src.tg_sender import MAX_RETRY_AFTER_S, TgSender
 
 
-def stored_topic_states(state):
-    return getattr(state, "topic_states")
-
-
-async def mark_topic_state(state, target: Target, enabled: bool):
-    await getattr(state, "mark_topic_state")(target, enabled)
-
-
-async def sync_forum_topics(sender, desired):
-    await getattr(sender, "sync_forum_topics")(desired)
-
-
 def request_form(request: httpx.Request) -> dict[str, list[str]]:
     return parse_qs(request.content.decode("ascii"))
 
@@ -38,11 +26,11 @@ async def test_sync_records_initially_enabled_topic_without_telegram_api_call(tm
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000), {topic.key: (topic, True)})
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics({topic.key: (topic, True)})
 
     assert requests == []
-    assert stored_topic_states(state) == {topic.key: True}
-    assert stored_topic_states(StateStore(state.path, state.dead_letter_path)) == {topic.key: True}
+    assert state.topic_states == {topic.key: True}
+    assert StateStore(state.path, state.dead_letter_path).topic_states == {topic.key: True}
 
 
 @pytest.mark.asyncio
@@ -56,12 +44,12 @@ async def test_sync_closes_initially_disabled_topic_and_persists_success(tmp_pat
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000), {topic.key: (topic, False)})
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics({topic.key: (topic, False)})
 
     assert [request.url.path for request in requests] == ["/bottoken/closeForumTopic"]
     assert request_form(requests[0]) == {"chat_id": [topic.chat_id], "message_thread_id": [str(topic.thread_id)]}
     assert all("deleteForumTopic" not in request.url.path for request in requests)
-    assert stored_topic_states(state) == {topic.key: False}
+    assert state.topic_states == {topic.key: False}
 
 
 @pytest.mark.asyncio
@@ -69,8 +57,8 @@ async def test_sync_skips_unchanged_topic_states(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     enabled = Target("-1001", 7)
     disabled = Target("-1001", 8)
-    await mark_topic_state(state, enabled, True)
-    await mark_topic_state(state, disabled, False)
+    await state.mark_topic_state(enabled, True)
+    await state.mark_topic_state(disabled, False)
     requests = []
 
     def handler(request):
@@ -79,17 +67,19 @@ async def test_sync_skips_unchanged_topic_states(tmp_path: Path):
 
     desired = {enabled.key: (enabled, True), disabled.key: (disabled, False)}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000), desired)
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics(desired)
 
     assert requests == []
-    assert stored_topic_states(state) == {enabled.key: True, disabled.key: False}
+    assert state.topic_states == {enabled.key: True, disabled.key: False}
 
 
 @pytest.mark.asyncio
-async def test_sync_reopens_false_to_true_and_persists_success(tmp_path: Path):
+async def test_sync_prunes_states_for_topics_no_longer_in_rules(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
-    topic = Target("-1001", 7)
-    await mark_topic_state(state, topic, False)
+    current = Target("-1001", 7)
+    deleted = Target("-1001", 8)
+    await state.mark_topic_state(current, True)
+    await state.mark_topic_state(deleted, False)
     requests = []
 
     def handler(request):
@@ -97,12 +87,30 @@ async def test_sync_reopens_false_to_true_and_persists_success(tmp_path: Path):
         return httpx.Response(200, json={"ok": True})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000), {topic.key: (topic, True)})
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics({current.key: (current, True)})
+
+    assert requests == []
+    assert state.topic_states == {current.key: True}
+
+
+@pytest.mark.asyncio
+async def test_sync_reopens_false_to_true_and_persists_success(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    topic = Target("-1001", 7)
+    await state.mark_topic_state(topic, False)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics({topic.key: (topic, True)})
 
     assert [request.url.path for request in requests] == ["/bottoken/reopenForumTopic"]
     assert request_form(requests[0]) == {"chat_id": [topic.chat_id], "message_thread_id": [str(topic.thread_id)]}
     assert all("deleteForumTopic" not in request.url.path for request in requests)
-    assert stored_topic_states(state) == {topic.key: True}
+    assert state.topic_states == {topic.key: True}
 
 
 @pytest.mark.asyncio
@@ -121,11 +129,11 @@ async def test_sync_persists_only_successful_api_outcomes(tmp_path: Path):
 
     desired = {closes.key: (closes, False), fails.key: (fails, False)}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000), desired)
+        await TgSender("token", client, state, 1000, 1000).sync_forum_topics(desired)
 
     assert [request.url.path for request in requests] == ["/bottoken/closeForumTopic", "/bottoken/closeForumTopic"]
-    assert stored_topic_states(state) == {closes.key: False}
-    assert stored_topic_states(StateStore(state.path, state.dead_letter_path)) == {closes.key: False}
+    assert state.topic_states == {closes.key: False}
+    assert StateStore(state.path, state.dead_letter_path).topic_states == {closes.key: False}
 
 
 @pytest.mark.asyncio
@@ -151,11 +159,11 @@ async def test_topic_api_retryable_failures_are_bounded_and_do_not_persist(tmp_p
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000, sleep=sleep), {topic.key: (topic, False)})
+        await TgSender("token", client, state, 1000, 1000, sleep=sleep).sync_forum_topics({topic.key: (topic, False)})
 
     assert attempts == 3
     assert waits == expected_waits
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
 
 
 @pytest.mark.asyncio
@@ -173,11 +181,11 @@ async def test_topic_api_nonretryable_4xx_is_single_attempt_and_does_not_persist
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000, sleep=sleep), {topic.key: (topic, False)})
+        await TgSender("token", client, state, 1000, 1000, sleep=sleep).sync_forum_topics({topic.key: (topic, False)})
 
     assert [request.url.path for request in requests] == ["/bottoken/closeForumTopic"]
     assert waits == []
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
 
 
 @pytest.mark.asyncio
@@ -195,10 +203,10 @@ async def test_topic_sync_caps_retry_after_and_total_elapsed_time(tmp_path: Path
         httpx.Response(500, json={"ok": False, "error_code": 500}),
     ]
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: responses.pop(0))) as client:
-        await sync_forum_topics(TgSender("token", client, state, 1000, 1000, sleep=no_wait), {topic.key: (topic, False)})
+        await TgSender("token", client, state, 1000, 1000, sleep=no_wait).sync_forum_topics({topic.key: (topic, False)})
 
     assert waits == [MAX_RETRY_AFTER_S, MAX_RETRY_AFTER_S]
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
 
     request_started = __import__("asyncio").Event()
 
@@ -212,4 +220,4 @@ async def test_topic_sync_caps_retry_after_and_total_elapsed_time(tmp_path: Path
         await sender.sync_forum_topics({topic.key: (topic, False)}, timeout_s=0.01)
 
     assert request_started.is_set()
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}

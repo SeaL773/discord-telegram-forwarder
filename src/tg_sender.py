@@ -138,10 +138,12 @@ class TgSender:
             log_error(f"forum topic sync timed out timeout_s={timeout_s}")
 
     async def _sync_forum_topics(self, desired: dict[str, tuple[Target, bool]]) -> None:
+        await self.state.prune_topic_states(set(desired))
+        previous_states = self.state.topic_states
         for key, (target, enabled) in desired.items():
             if target.thread_id is None or target.thread_id <= 1:
                 continue
-            previous = self.state.topic_states.get(key)
+            previous = previous_states.get(key)
             if previous is enabled:
                 continue
             if previous is None and enabled:
