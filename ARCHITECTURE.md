@@ -145,7 +145,7 @@ discord-message-bridge            Telegram Bot API
 
 ### 4.6 StateStore
 
-- 内容包含: `last_acked_cursor`、恢复计划、少量运行统计和成功的 `topic_states`。Telegram 没有可用的 Topic 状态查询,因此该字段记录本程序上一次成功操作/首次升级基线,不是服务端绝对真相。
+- 内容包含: `last_acked_cursor`、恢复计划、少量运行统计和当前规则所管理 Topic 的成功 `topic_states`。启动同步会原子裁剪规则中已不存在的 Topic key,但不修改 cursor、bootstrap 或 in-flight 恢复数据。Telegram 没有可用的 Topic 状态查询,因此该字段记录本程序上一次成功操作/首次升级基线,不是服务端绝对真相。
 - 实现: 单个 JSON 文件,原子写(write temp + rename),挂载到 Docker volume。消息量不构成用 SQLite 的理由。
 - 目标死信采用稳定 identity 和可恢复幂等终态转换: 若死信 append+fsync 后、状态终态持久化前崩溃,重启会识别已有记录并只补写目标终态,不重发、不重复追加死信;其他目标仍保持独立 pending。该协议不宣称两个文件之间具备原子事务。
 
