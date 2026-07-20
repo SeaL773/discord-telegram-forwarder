@@ -8,14 +8,6 @@ from src.models import Target
 from src.state import StateStore
 
 
-def stored_topic_states(state):
-    return getattr(state, "topic_states")
-
-
-async def mark_topic_state(state, target: Target, enabled: bool):
-    await getattr(state, "mark_topic_state")(target, enabled)
-
-
 def old_state_payload():
     return {
         "version": 1,
@@ -32,7 +24,7 @@ def test_old_state_file_gains_empty_topic_states_backward_compatibly(tmp_path: P
 
     state = StateStore(path, tmp_path / "dead.ndjson")
 
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
     assert state.data["topic_states"] == {}
 
 
@@ -42,26 +34,72 @@ async def test_topic_state_persists_only_when_explicitly_marked(tmp_path: Path):
     state = StateStore(path, tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
 
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
     assert not path.exists()
 
-    await mark_topic_state(state, topic, False)
+    await state.mark_topic_state(topic, False)
 
-    assert stored_topic_states(state) == {topic.key: False}
-    assert stored_topic_states(StateStore(path, state.dead_letter_path)) == {topic.key: False}
+    assert state.topic_states == {topic.key: False}
+    assert StateStore(path, state.dead_letter_path).topic_states == {topic.key: False}
 
 
 @pytest.mark.asyncio
 async def test_topic_state_view_is_a_copy_and_marker_requires_boolean(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     topic = Target("-1001", 7)
-    view = stored_topic_states(state)
+    view = state.topic_states
     view[topic.key] = False
 
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
     with pytest.raises(ValueError, match="boolean"):
         await state.mark_topic_state(topic, 1)
-    assert stored_topic_states(state) == {}
+    assert state.topic_states == {}
+
+
+@pytest.mark.asyncio
+async def test_prune_topic_states_removes_deleted_topics_and_persists(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    current = Target("-1001", 7)
+    deleted = Target("-1001", 8)
+    await state.mark_topic_state(current, True)
+    await state.mark_topic_state(deleted, False)
+
+    await state.prune_topic_states({current.key})
+
+    assert state.topic_states == {current.key: True}
+    assert StateStore(state.path, state.dead_letter_path).topic_states == {current.key: True}
+
+
+@pytest.mark.asyncio
+async def test_prune_topic_states_noop_skips_persist(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    current = Target("-1001", 7)
+    await state.mark_topic_state(current, True)
+
+    async def unexpected_persist():
+        raise AssertionError("no-op prune must not persist")
+
+    monkeypatch.setattr(state, "_persist", unexpected_persist)
+    await state.prune_topic_states({current.key})
+    assert state.topic_states == {current.key: True}
+
+
+@pytest.mark.asyncio
+async def test_prune_topic_states_rolls_back_memory_on_persist_failure(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    current = Target("-1001", 7)
+    deleted = Target("-1001", 8)
+    await state.mark_topic_state(current, True)
+    await state.mark_topic_state(deleted, False)
+    original = state.topic_states
+
+    async def fail_persist():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError, match="disk full"):
+        await state.prune_topic_states({current.key})
+    assert state.topic_states == original
 
 
 @pytest.mark.parametrize("topic_states", [

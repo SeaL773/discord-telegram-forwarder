@@ -171,6 +171,21 @@ class StateStore:
             self.data["topic_states"][target.key] = enabled
             await self._persist()
 
+    async def prune_topic_states(self, keep_keys: set[str]) -> None:
+        if any(not isinstance(key, str) for key in keep_keys):
+            raise ValueError("topic state keys must be strings")
+        async with self._lock:
+            current = self.data["topic_states"]
+            retained = {key: enabled for key, enabled in current.items() if key in keep_keys}
+            if retained == current:
+                return
+            self.data["topic_states"] = retained
+            try:
+                await self._persist()
+            except BaseException:
+                self.data["topic_states"] = current
+                raise
+
     async def save_bootstrap(self, ready_cursor: str, items: list[dict[str, Any]]) -> None:
         async with self._lock:
             if self.data["bootstrap"] is not None or self.data["in_flight"] is not None:
