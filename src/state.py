@@ -15,6 +15,8 @@ from .models import Envelope, Target
 STAT_NAMES = {"forwarded", "dropped", "dead_lettered", "gaps"}
 DLQ_SCAN_CHUNK_SIZE = 64 * 1024
 DLQ_MAX_RECOVERY_RECORD_BYTES = 16 * 1024 * 1024
+DEFAULT_DEAD_LETTER_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_DEAD_LETTER_BACKUP_COUNT = 2
 DEFAULT_STATE: dict[str, Any] = {
     "version": 1,
     "last_acked_cursor": None,
@@ -26,9 +28,21 @@ DEFAULT_STATE: dict[str, Any] = {
 
 
 class StateStore:
-    def __init__(self, path: Path, dead_letter_path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        dead_letter_path: Path,
+        dead_letter_max_bytes: int = DEFAULT_DEAD_LETTER_MAX_BYTES,
+        dead_letter_backup_count: int = DEFAULT_DEAD_LETTER_BACKUP_COUNT,
+    ) -> None:
+        if not isinstance(dead_letter_max_bytes, int) or isinstance(dead_letter_max_bytes, bool) or dead_letter_max_bytes <= 0:
+            raise ValueError("dead_letter_max_bytes must be a positive integer")
+        if not isinstance(dead_letter_backup_count, int) or isinstance(dead_letter_backup_count, bool) or dead_letter_backup_count < 1:
+            raise ValueError("dead_letter_backup_count must be a positive integer")
         self.path = path
         self.dead_letter_path = dead_letter_path
+        self.dead_letter_max_bytes = dead_letter_max_bytes
+        self.dead_letter_backup_count = dead_letter_backup_count
         self._lock = asyncio.Lock()
         self._dead_letter_checked_ids: set[str] = set()
         self._dead_letter_found_ids: set[str] = set()
@@ -266,6 +280,12 @@ class StateStore:
     def _append_dead_letter(self, record: dict[str, Any]) -> None:
         self.dead_letter_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.dead_letter_path.parent, 0o700)
+        payload = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+        self._complete_pending_dead_letter_rotation()
+        if self._dead_letter_rotation_required(len(payload)):
+            self._write_pending_dead_letter(payload)
+            self._complete_pending_dead_letter_rotation()
+            return
         flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -275,7 +295,6 @@ class StateStore:
             if not stat.S_ISREG(file_stat.st_mode):
                 raise RuntimeError("dead-letter path is not a regular file")
             os.fchmod(fd, 0o600)
-            payload = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
             if file_stat.st_size and os.pread(fd, 1, file_stat.st_size - 1) != b"\n":
                 self._write_all(fd, b"\n")
             self._write_all(fd, payload)
@@ -283,6 +302,93 @@ class StateStore:
         finally:
             os.close(fd)
         self._fsync_parent(self.dead_letter_path.parent)
+
+    def _rotated_dead_letter_path(self, index: int) -> Path:
+        return Path(f"{self.dead_letter_path}.{index}")
+
+    def _pending_dead_letter_path(self) -> Path:
+        return Path(f"{self.dead_letter_path}.pending")
+
+    @staticmethod
+    def _validate_regular_path(path: Path) -> bool:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(path_stat.st_mode):
+            raise OSError(f"dead-letter path must not be a symlink: {path}")
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise RuntimeError(f"dead-letter path is not a regular file: {path}")
+        return True
+
+    def _dead_letter_rotation_required(self, payload_size: int) -> bool:
+        if not self._validate_regular_path(self.dead_letter_path):
+            return False
+        active_size = self.dead_letter_path.stat().st_size
+        if active_size == 0:
+            return False
+        separator_size = 1 if active_size and self._last_byte_is_not_newline(self.dead_letter_path) else 0
+        return active_size + separator_size + payload_size > self.dead_letter_max_bytes
+
+    def _write_pending_dead_letter(self, payload: bytes) -> None:
+        pending = self._pending_dead_letter_path()
+        self._validate_regular_path(pending)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(pending, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("pending dead-letter path is not a regular file")
+            os.fchmod(fd, 0o600)
+            self._write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._fsync_parent(self.dead_letter_path.parent)
+
+    def _complete_pending_dead_letter_rotation(self) -> None:
+        pending = self._pending_dead_letter_path()
+        if not self._validate_regular_path(pending):
+            return
+        os.chmod(pending, 0o600)
+        for index in range(1, self.dead_letter_backup_count + 1):
+            self._validate_regular_path(self._rotated_dead_letter_path(index))
+        for index in range(self.dead_letter_backup_count - 1, 0, -1):
+            source = self._rotated_dead_letter_path(index)
+            if self._validate_regular_path(source):
+                os.replace(source, self._rotated_dead_letter_path(index + 1))
+                self._fsync_parent(self.dead_letter_path.parent)
+        if self._validate_regular_path(self.dead_letter_path):
+            os.replace(self.dead_letter_path, self._rotated_dead_letter_path(1))
+            os.chmod(self._rotated_dead_letter_path(1), 0o600)
+            self._fsync_parent(self.dead_letter_path.parent)
+        os.replace(pending, self.dead_letter_path)
+        os.chmod(self.dead_letter_path, 0o600)
+        self._remove_excess_dead_letter_backups()
+        self._fsync_parent(self.dead_letter_path.parent)
+
+    def _remove_excess_dead_letter_backups(self) -> None:
+        prefix = f"{self.dead_letter_path.name}."
+        for path in self.dead_letter_path.parent.iterdir():
+            suffix = path.name.removeprefix(prefix)
+            if path.name.startswith(prefix) and suffix.isdecimal() and int(suffix) > self.dead_letter_backup_count:
+                self._validate_regular_path(path)
+                path.unlink()
+
+    @staticmethod
+    def _last_byte_is_not_newline(path: Path) -> bool:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError("dead-letter path is not a regular file")
+            return bool(file_stat.st_size and os.pread(fd, 1, file_stat.st_size - 1) != b"\n")
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _write_all(fd: int, payload: bytes) -> None:
@@ -297,28 +403,55 @@ class StateStore:
         unchecked = requested - self._dead_letter_checked_ids
         if not unchecked:
             return requested & self._dead_letter_found_ids
-        if self._dead_letter_scan_complete or not self.dead_letter_path.exists():
+        if self._dead_letter_scan_complete:
             self._dead_letter_checked_ids.update(unchecked)
-            self._dead_letter_scan_complete = True
             return requested & self._dead_letter_found_ids
-        if self.dead_letter_path.is_symlink():
-            raise RuntimeError("dead-letter path must not be a symlink")
+        for path in self._dead_letter_paths():
+            self._scan_dead_letter_ids(path, unchecked)
+        self._dead_letter_checked_ids.update(unchecked)
+        self._dead_letter_scan_complete = True
+        return requested & self._dead_letter_found_ids
+
+    def _dead_letter_paths(self) -> list[Path]:
+        return [
+            self.dead_letter_path,
+            *(self._rotated_dead_letter_path(index) for index in range(1, self.dead_letter_backup_count + 1)),
+            self._pending_dead_letter_path(),
+        ]
+
+    def _scan_dead_letter_ids(self, path: Path, requested: set[str]) -> None:
+        if not self._validate_regular_path(path):
+            return
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(self.dead_letter_path, flags)
+        fd = os.open(path, flags)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise RuntimeError("dead-letter path is not a regular file")
+            os.fchmod(fd, 0o600)
             record = bytearray()
             oversized = False
+            oversized_identity: str | None = None
+            identity_probe_limit = max(
+                (
+                    len(b'"dead_letter_id":') + len(json.dumps(identity, ensure_ascii=True).encode("ascii"))
+                    for identity in requested
+                ),
+                default=0,
+            )
             while chunk := os.read(fd, DLQ_SCAN_CHUNK_SIZE):
                 segments = chunk.split(b"\n")
                 for index, segment in enumerate(segments):
                     if not oversized:
-                        if len(record) + len(segment) <= DLQ_MAX_RECOVERY_RECORD_BYTES:
+                        probe_limit = max(DLQ_MAX_RECOVERY_RECORD_BYTES, identity_probe_limit)
+                        if len(record) + len(segment) <= probe_limit:
                             record.extend(segment)
                         else:
+                            needed = max(0, probe_limit - len(record))
+                            if needed:
+                                record.extend(segment[:needed])
+                            oversized_identity = self._dead_letter_identity_prefix(record, requested)
                             record.clear()
                             oversized = True
                     if index == len(segments) - 1:
@@ -330,15 +463,23 @@ class StateStore:
                             pass
                         else:
                             identity = value.get("dead_letter_id") if isinstance(value, dict) else None
-                            if identity in unchecked:
+                            if identity in requested:
                                 self._dead_letter_found_ids.add(identity)
+                    elif oversized_identity is not None:
+                        self._dead_letter_found_ids.add(oversized_identity)
                     record.clear()
                     oversized = False
+                    oversized_identity = None
         finally:
             os.close(fd)
-        self._dead_letter_checked_ids.update(unchecked)
-        self._dead_letter_scan_complete = True
-        return requested & self._dead_letter_found_ids
+
+    @staticmethod
+    def _dead_letter_identity_prefix(record: bytearray, requested: set[str]) -> str | None:
+        for identity in requested:
+            field = b'"dead_letter_id":' + json.dumps(identity, ensure_ascii=True).encode("ascii")
+            if field in record:
+                return identity
+        return None
 
     def _target_dead_letter_id(self, target_index: int) -> str:
         inflight = self.in_flight
@@ -356,7 +497,7 @@ class StateStore:
             identity = self._target_dead_letter_id(target_index)
             before = deepcopy(self.data)
             if identity not in self._dead_letter_ids({identity}):
-                self._append_dead_letter({**record, "dead_letter_id": identity})
+                self._append_dead_letter({"dead_letter_id": identity, **{key: value for key, value in record.items() if key != "dead_letter_id"}})
                 self._dead_letter_checked_ids.add(identity)
                 self._dead_letter_found_ids.add(identity)
             try:

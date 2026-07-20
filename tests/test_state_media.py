@@ -72,6 +72,124 @@ async def test_target_dead_letter_recovers_after_append_before_terminal_without_
 
 
 @pytest.mark.asyncio
+async def test_dead_letter_rotates_before_threshold_and_bounds_backups(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    records = [{"sequence": index, "payload": "x" * 45} for index in range(4)]
+
+    for record in records:
+        await state.dead_letter(record)
+
+    paths = [state.dead_letter_path, Path(f"{state.dead_letter_path}.1"), Path(f"{state.dead_letter_path}.2")]
+    assert all(path.is_file() for path in paths)
+    assert not Path(f"{state.dead_letter_path}.3").exists()
+    retained = [json.loads(line)["sequence"] for path in reversed(paths) for line in path.read_text().splitlines()]
+    assert retained == [1, 2, 3]
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_target_dead_letter_recovers_identity_from_rotated_file_without_duplicate(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=160, dead_letter_backup_count=2)
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    original_persist = state._persist
+    monkeypatch.setattr(state, "_persist", lambda: (_ for _ in ()).throw(OSError("terminal persist failed")))
+    with pytest.raises(OSError, match="terminal persist failed"):
+        await state.dead_letter_target(0, target_dead_letter_record())
+    monkeypatch.setattr(state, "_persist", original_persist)
+
+    await state.dead_letter({"payload": "x" * 160})
+    rotated = Path(f"{state.dead_letter_path}.1")
+    assert "target:cursor:0:1:" in rotated.read_text()
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=160, dead_letter_backup_count=2)
+    await restarted.recover_target_dead_letters()
+    await restarted.recover_target_dead_letters()
+
+    inflight = restarted.in_flight
+    assert inflight is not None and inflight["targets"][0]["status"] == "dead_lettered"
+    assert restarted.data["stats"]["dead_lettered"] == 2
+    assert sum(path.read_text().count("target:cursor:0:1:") for path in (state.dead_letter_path, rotated)) == 1
+
+
+@pytest.mark.asyncio
+async def test_rotated_recovery_tolerates_malformed_records_and_rejects_symlink(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=160, dead_letter_backup_count=2)
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    identity = state._target_dead_letter_id(0)
+    Path(f"{state.dead_letter_path}.2").write_bytes(b"not-json\n" + json.dumps({"dead_letter_id": identity}).encode() + b"\n")
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=160, dead_letter_backup_count=2)
+    await restarted.recover_target_dead_letters()
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "dead_lettered"
+
+    linked_state = StateStore(tmp_path / "other-state.json", tmp_path / "other-dead.ndjson", dead_letter_max_bytes=160, dead_letter_backup_count=2)
+    await linked_state.begin(Envelope("other", {"x": 1}), [Target("1")])
+    Path(f"{linked_state.dead_letter_path}.1").symlink_to(Path(f"{state.dead_letter_path}.2"))
+    with pytest.raises(OSError, match="symlink"):
+        await linked_state.recover_target_dead_letters()
+
+
+@pytest.mark.asyncio
+async def test_empty_active_after_crash_does_not_evict_recovery_identity(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    identity = state._target_dead_letter_id(0)
+    oldest = Path(f"{state.dead_letter_path}.2")
+    oldest.write_text(json.dumps({"dead_letter_id": identity}) + "\n", encoding="ascii")
+    state.dead_letter_path.touch()
+
+    await state.dead_letter({"payload": "x" * 150})
+
+    assert oldest.exists()
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await restarted.recover_target_dead_letters()
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "dead_lettered"
+
+
+@pytest.mark.asyncio
+async def test_recovery_survives_interrupted_rotation_shift(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    identity = state._target_dead_letter_id(0)
+    state.dead_letter_path.write_text(json.dumps({"dead_letter_id": identity}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.1").write_text('{"old":true}\n', encoding="ascii")
+    original_replace = os.replace
+
+    def fail_active_shift(source, destination):
+        if Path(source) == state.dead_letter_path:
+            raise OSError("crash during rotation")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_active_shift)
+    with pytest.raises(OSError, match="crash during rotation"):
+        await state.dead_letter({"payload": "x" * 150})
+    monkeypatch.setattr(os, "replace", original_replace)
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await restarted.recover_target_dead_letters()
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "dead_lettered"
+    assert sum(path.read_text().count(identity) for path in restarted._dead_letter_paths() if path.exists()) == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_target_record_keeps_recoverable_identity_prefix(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("src.state.DLQ_MAX_RECOVERY_RECORD_BYTES", 64)
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    original_persist = state._persist
+    monkeypatch.setattr(state, "_persist", lambda: (_ for _ in ()).throw(OSError("terminal persist failed")))
+    with pytest.raises(OSError, match="terminal persist failed"):
+        await state.dead_letter_target(0, {**target_dead_letter_record(), "event": {"payload": "x" * 256}})
+    monkeypatch.setattr(state, "_persist", original_persist)
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    await restarted.recover_target_dead_letters()
+
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "dead_lettered"
+    assert restarted.dead_letter_path.read_bytes().startswith(b'{"dead_letter_id":"target:cursor:0:1:",')
+
+
+@pytest.mark.asyncio
 async def test_target_dead_letter_normal_transition_is_terminal_and_single_record(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     await state.begin(Envelope("cursor", {"x": 1}), [Target("1"), Target("2")])
@@ -480,7 +598,7 @@ def test_config_defaults_health_to_loopback(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("TG_BOT_TOKEN", "fake")
     monkeypatch.setenv("BRIDGE_TOKEN", "fake")
     path = tmp_path / "config.yaml"
-    path.write_text("{}", encoding="utf-8")
+    path.write_text('admin_chat_id: "123"', encoding="utf-8")
     assert load_config(path).health_host == "127.0.0.1"
 
 

@@ -126,7 +126,12 @@ async def run() -> None:
     config = load_config()
     if not config.tg_token or not config.bridge_token:
         raise RuntimeError("TG_BOT_TOKEN and BRIDGE_TOKEN are required")
-    state = StateStore(config.state_path, config.dead_letter_path)
+    state = StateStore(
+        config.state_path,
+        config.dead_letter_path,
+        dead_letter_max_bytes=config.dead_letter_max_bytes,
+        dead_letter_backup_count=config.dead_letter_backup_count,
+    )
     router = Router(config.rules_path)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
