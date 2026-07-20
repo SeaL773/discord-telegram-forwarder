@@ -105,8 +105,9 @@ discord-message-bridge            Telegram Bot API
 - 动作:
   - `forward_to`: 一个或多个目标(chat_id + 可选 topic thread_id),一条消息可同时转发到多个 TG 目标
   - `drop`: 显式丢弃
+- 可读控制字段: `channel_name` 保存频道显示名;`enabled` 默认 true。首个匹配但 disabled 的规则是终止式 drop,不会落入后续规则或 default。
 - **default_action: drop**(推荐)。个人账户能看到的消息量很大,白名单式转发是安全默认;想全转的话把 default 改成 forward 即可。
-- 配置热重载: 监听 `rules.yaml` mtime,变更后原子替换规则集,无需重启容器。目标必须包含非空标量 `chat_id`,可选 `thread_id` 必须是非负整数;管理员输入错误统一按配置错误拒绝,保留旧的不可变快照且 watcher 继续运行。
+- 配置热重载: 监听 `rules.yaml` mtime,变更后原子替换规则集,无需重启容器。热重载只立即改变消息路由;Telegram Topic 的 close/reopen 明确只在进程启动时同步。目标必须包含非空标量 `chat_id`,可选 `thread_id` 必须是非负整数;管理员输入错误统一按配置错误拒绝,保留旧的不可变快照且 watcher 继续运行。
 
 ### 4.3 Formatter — 消息格式化
 
@@ -140,10 +141,11 @@ discord-message-bridge            Telegram Bot API
 - 令牌桶限流: 全局 ~30 msg/s,**单 chat ~20 msg/min**(TG 对群组的硬限制,这是最容易踩的坑);突发容量与持续 refill rate 分离,允许单个最多 10 项的媒体组,不抬高配置的持续速率。
 - 429 处理: 读取 `retry_after` 精确等待后重试。
 - 网络错误: 重试 3 次(指数退避),仍失败则记 `failed-events.ndjson` 死信文件 + 日志告警,然后**继续推进 cursor**(不让一条毒消息卡死整个流水线)。
+- 启动 Topic 同步只使用可逆的 `closeForumTopic` / `reopenForumTopic`,排除 General Topic,绝不删除历史。health endpoint 先启动;同步总预算 60 秒,单次 `retry_after` 最多 60 秒,预算耗尽后记录元数据告警并继续启动消息流水线。
 
 ### 4.6 StateStore
 
-- 内容极简: `last_acked_cursor` + 少量运行统计。
+- 内容包含: `last_acked_cursor`、恢复计划、少量运行统计和成功的 `topic_states`。Telegram 没有可用的 Topic 状态查询,因此该字段记录本程序上一次成功操作/首次升级基线,不是服务端绝对真相。
 - 实现: 单个 JSON 文件,原子写(write temp + rename),挂载到 Docker volume。消息量不构成用 SQLite 的理由。
 - 目标死信采用稳定 identity 和可恢复幂等终态转换: 若死信 append+fsync 后、状态终态持久化前崩溃,重启会识别已有记录并只补写目标终态,不重发、不重复追加死信;其他目标仍保持独立 pending。该协议不宣称两个文件之间具备原子事务。
 

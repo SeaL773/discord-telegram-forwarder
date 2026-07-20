@@ -1,6 +1,8 @@
 # First match wins. Replace placeholders with real IDs before enabling rules.
 rules:
   - name: placeholder-disabled
+    channel_name: "Replace with the Discord channel name"
+    enabled: false
     match:
       channel_id: "REPLACE_ME"
     action: drop
