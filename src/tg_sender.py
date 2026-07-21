@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from .LoggerManager import log_error
-from .formatter import add_fallbacks
+from .formatter import add_fallbacks, rich_fallback_html, truncate_rich_html
 from .models import DownloadedMedia, Envelope, FormattedMessage, Target
 from .state import StateStore
 
@@ -76,6 +76,7 @@ class ApiResult:
     retry_after: float | None = None
     retryable: bool = False
     reason: str = ""
+    code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,17 +88,19 @@ class RequestBatch:
 
 
 class TgSender:
-    def __init__(self, token: str, client: httpx.AsyncClient, state: StateStore, global_per_s: float = 25, chat_per_min: float = 18, sleep: Any = asyncio.sleep) -> None:
+    def __init__(self, token: str, client: httpx.AsyncClient, state: StateStore, global_per_s: float = 25, chat_per_min: float = 18, sleep: Any = asyncio.sleep, rich_messages_enabled: bool = False) -> None:
         self.client = client
         self.state = state
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.limiter = DualLimiter(TokenBucket(max(10, global_per_s), global_per_s), chat_per_min, sleep)
         self.sleep = sleep
         self._attempt_lock = asyncio.Lock()
+        self.rich_messages_enabled = rich_messages_enabled
 
     async def send_event(self, envelope: Envelope, targets: list[Target], formatted: FormattedMessage, media: list[DownloadedMedia], fallback_urls: list[str], attachment_urls: list[str] | None = None) -> None:
+        rich_eligible = self._rich_eligible(formatted, media)
         if self.state.in_flight is None:
-            await self.state.begin(envelope, targets)
+            await self.state.begin(envelope, targets, "rich" if rich_eligible else "media")
         await self.state.recover_target_dead_letters()
         inflight = self.state.in_flight
         if inflight is None or inflight.get("cursor") != envelope.cursor:
@@ -109,7 +112,7 @@ class TgSender:
         for index, target in enumerate(targets):
             if index < len(records) and records[index].get("status") != "pending":
                 continue
-            await self._send_target(index, envelope, target, normal_formatted, fallback_formatted, media)
+            await self._send_target(index, envelope, target, normal_formatted, fallback_formatted, media, fallback_urls)
         await self.state.finish(envelope.cursor, "forwarded")
 
     async def send_alert(self, chat_id: str, text: str) -> bool:
@@ -174,10 +177,14 @@ class TgSender:
                     f"thread_id={target.thread_id} desired_enabled={enabled} reason={result.reason}"
                 )
 
-    async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia]) -> None:
+    async def _send_target(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia], fallback_urls: list[str]) -> None:
         target_state = self.state.in_flight["targets"][index] if self.state.in_flight else {}
+        phase = target_state.get("phase", "media")
+        if phase == "rich":
+            await self._send_rich(index, envelope, target, formatted, fallback_formatted, media, fallback_urls)
+            return
         failures = int(target_state.get("retries", 0))
-        if target_state.get("phase") == "fallback":
+        if phase == "fallback":
             await self._send_fallback(index, envelope, target, fallback_formatted)
             return
         batches = self._requests(target, formatted, media)
@@ -203,6 +210,56 @@ class TgSender:
                     await self.state.dead_letter_target(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason})
                 return
         await self.state.terminal(index, "sent")
+
+    def _rich_eligible(self, formatted: FormattedMessage, media: list[DownloadedMedia]) -> bool:
+        return (
+            self.rich_messages_enabled
+            and formatted.style == "editorial"
+            and formatted.rich_html is not None
+            and len(media) <= 50
+            and all(item.kind in {"photo", "video"} for item in media)
+        )
+
+    async def _send_rich(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage, fallback_formatted: FormattedMessage, media: list[DownloadedMedia], fallback_urls: list[str]) -> None:
+        if formatted.rich_html is None or formatted.style != "editorial" or len(media) > 50 or any(item.kind not in {"photo", "video"} for item in media):
+            await self.state.set_media(index)
+            await self._send_target(index, envelope, target, formatted, fallback_formatted, media, fallback_urls)
+            return
+        failures = int(self.state.in_flight["targets"][index].get("rich_retries", 0)) if self.state.in_flight else 0
+        batch = self._rich_request(target, formatted.rich_html, media, fallback_urls)
+        while True:
+            result = await self._attempt(batch, target)
+            if result.ok:
+                await self.state.terminal(index, "sent")
+                return
+            if result.retry_after is not None:
+                await self.sleep(result.retry_after)
+                continue
+            if result.code in {400, 404, 413}:
+                await self.state.set_media(index)
+                await self._send_target(index, envelope, target, formatted, fallback_formatted, media, fallback_urls)
+                return
+            if result.code in {401, 403}:
+                await self.state.dead_letter_target(index, self._target_dead_letter(envelope, target, "rich", result.reason))
+                return
+            if result.retryable:
+                failures += 1
+                await self.state.retry(index, rich=True)
+                if failures < 3:
+                    await self.sleep(2 ** (failures - 1))
+                    continue
+            await self.state.dead_letter_target(index, self._target_dead_letter(envelope, target, "rich", result.reason))
+            return
+
+    @staticmethod
+    def _target_dead_letter(envelope: Envelope, target: Target, phase: str, reason: str) -> dict[str, Any]:
+        return {
+            "cursor": envelope.cursor,
+            "event": envelope.event,
+            "target": {"chat_id": target.chat_id, "thread_id": target.thread_id},
+            "phase": phase,
+            "reason": reason,
+        }
 
     async def _send_fallback(self, index: int, envelope: Envelope, target: Target, formatted: FormattedMessage) -> None:
         inflight = self.state.in_flight
@@ -272,6 +329,42 @@ class TgSender:
             result.append(RequestBatch("sendMediaGroup", {**common, "media": json.dumps(payload)}, files, len(group)))
         return result
 
+    def _rich_request(self, target: Target, rich_html: str, media: list[DownloadedMedia], fallback_urls: list[str]) -> RequestBatch:
+        if len(media) > 50:
+            raise ValueError("rich message media limit exceeded")
+        media_entries: list[dict[str, object]] = []
+        files: dict[str, tuple[str, bytes, str]] = {}
+        references: list[str] = []
+        for index, item in enumerate(media):
+            if item.kind not in {"photo", "video"}:
+                raise ValueError("rich message supports only photo and video media")
+            media_id = f"m{index}"
+            file_id = f"file{index}"
+            media_entries.append({"id": media_id, "media": {"type": item.kind, "media": f"attach://{file_id}"}})
+            files[file_id] = (item.attachment.filename, item.data, item.content_type)
+            references.append(
+                f'<img src="tg://photo?id={media_id}"/>' if item.kind == "photo"
+                else f'<video src="tg://video?id={media_id}"></video>'
+            )
+        media_html = ""
+        if len(references) == 1:
+            media_html = references[0]
+        elif references:
+            media_html = "<tg-collage>" + "".join(references) + "</tg-collage>"
+        body = rich_fallback_html(rich_html, fallback_urls)
+        media_blocks = len(references) + (1 if len(references) > 1 else 0)
+        payload: dict[str, object] = {
+            "html": truncate_rich_html(body, 32768 - len(media_html), 500 - media_blocks) + media_html
+        }
+        if media_entries:
+            payload["media"] = media_entries
+        return RequestBatch(
+            "sendRichMessage",
+            {**self._common(target), "rich_message": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+            files or None,
+            1,
+        )
+
     async def _attempt(self, batch: RequestBatch, target: Target) -> ApiResult:
         async with self._attempt_lock:
             await self.limiter.acquire(target.chat_id, batch.cost)
@@ -294,12 +387,12 @@ class TgSender:
                     if not math.isfinite(retry_after) or retry_after < 0:
                         raise ValueError("invalid retry delay")
                 except (ValueError, KeyError, TypeError):
-                    return ApiResult(False, retryable=True, reason="malformed_429")
-                return ApiResult(False, retry_after=min(retry_after, MAX_RETRY_AFTER_S), reason="rate_limited")
+                    return ApiResult(False, retryable=True, reason="malformed_429", code=429)
+                return ApiResult(False, retry_after=min(retry_after, MAX_RETRY_AFTER_S), reason="rate_limited", code=429)
             if status >= 500 or code >= 500:
-                return ApiResult(False, retryable=True, reason=f"http_{code}")
+                return ApiResult(False, retryable=True, reason=f"http_{code}", code=code)
             if status >= 400 or 400 <= code < 500:
-                return ApiResult(False, reason=f"http_{code}")
+                return ApiResult(False, reason=f"http_{code}", code=code)
             if not isinstance(body, dict) or body.get("ok") is not True:
-                return ApiResult(False, retryable=True, reason="malformed_success")
-            return ApiResult(True)
+                return ApiResult(False, retryable=True, reason="malformed_success", code=code)
+            return ApiResult(True, code=code)
