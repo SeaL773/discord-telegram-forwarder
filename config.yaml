@@ -2,6 +2,7 @@ bridge:
   url: "http://host.docker.internal:17891"
   reconnect_max_backoff_s: 60
 telegram:
+  rich_messages_enabled: false
   rate_limit_global_per_s: 25
   rate_limit_per_chat_per_min: 18
   media_max_bytes: 20971520

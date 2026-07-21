@@ -33,6 +33,23 @@ def test_config_range_validation(tmp_path: Path):
         load_config(path)
 
 
+@pytest.mark.parametrize("value", ["'yes'", "1", "null", "[]", "{}"])
+def test_rich_messages_config_requires_boolean(tmp_path: Path, value: str):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"admin_chat_id: '1'\ntelegram:\n  rich_messages_enabled: {value}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="rich_messages_enabled"):
+        load_config(path)
+
+
+def test_rich_messages_config_defaults_false_and_accepts_true(tmp_path: Path):
+    default_path = tmp_path / "default.yaml"
+    default_path.write_text("admin_chat_id: '1'\n", encoding="utf-8")
+    enabled_path = tmp_path / "enabled.yaml"
+    enabled_path.write_text("admin_chat_id: '1'\ntelegram: {rich_messages_enabled: true}\n", encoding="utf-8")
+    assert load_config(default_path).rich_messages_enabled is False
+    assert load_config(enabled_path).rich_messages_enabled is True
+
+
 def test_config_requires_explicit_admin_chat_id(tmp_path: Path):
     path = tmp_path / "config.yaml"
     path.write_text("{}\n", encoding="utf-8")
@@ -96,6 +113,7 @@ def test_docs_and_config_consistency():
     env_example = (root / ".env.example").read_text()
     assert "host: 127.0.0.1" in config
     assert "media_max_attachments: 20" in config and "prepared_queue_size: 4" in config
+    assert "rich_messages_enabled: false" in config and "telegram.rich_messages_enabled" in readme
     assert "dead_letter_max_bytes: 33554432" in config and "dead_letter_backup_count: 2" in config
     assert "host.docker.internal" in readme and "mode-0600" in readme
     assert "approximately 96 MiB total" in readme and "no age-based deletion" in readme

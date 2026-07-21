@@ -10,6 +10,7 @@ import yaml
 
 
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+_MISSING = object()
 DEFAULT_DEAD_LETTER_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_DEAD_LETTER_BACKUP_COUNT = 2
 
@@ -36,6 +37,7 @@ class AppConfig:
     queue_size: int
     tg_token: str
     bridge_token: str
+    rich_messages_enabled: bool
 
 
 def _expand(value: Any) -> Any:
@@ -52,6 +54,13 @@ def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
     return value
+
+
+def _boolean(value: Any, name: str, default: bool) -> bool:
+    resolved = default if value is _MISSING else value
+    if not isinstance(resolved, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return resolved
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
@@ -98,6 +107,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         queue_size=int(raw.get("queue_size", 10000)),
         tg_token=os.environ.get("TG_BOT_TOKEN", ""),
         bridge_token=os.environ.get("BRIDGE_TOKEN", ""),
+        rich_messages_enabled=_boolean(telegram.get("rich_messages_enabled", _MISSING), "telegram.rich_messages_enabled", False),
     )
     if not config.bridge_url.startswith(("http://", "https://")):
         raise ValueError("bridge.url must be http(s)")
