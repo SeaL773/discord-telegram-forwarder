@@ -157,7 +157,7 @@ def test_realistic_upstream_shape_uses_id_fallbacks_and_renders_stickers():
         },
     }
     text = format_event(value).text
-    assert "#channel-123" in text and "@ guild-456" in text and "@ DM" not in text
+    assert "#channel-123" in text and "<i>guild-456</i>" in text and "<i>DM</i>" not in text
     assert "collector-user" in text and "wave &lt;hello&gt;" in text
     assert "https://cdn.discordapp.com/stickers/1.png" in text
     assert "https://cdn.discordapp.com/stickers/2.png" in text
@@ -173,7 +173,7 @@ def test_collector_top_level_names_override_message_id_fallbacks():
     value["guild_name"] = "猫猫炒美股"
     text = format_event(value).text
     assert "#实时市场消息提醒" in text
-    assert "@ 猫猫炒美股" in text
+    assert "<i>猫猫炒美股</i>" in text
     assert "#channel" not in text
 
 
@@ -385,9 +385,10 @@ def test_embed_dict_shape_caps_embeds_fields_and_keeps_caption_utf16_safe():
     assert caption.count("<b>") == caption.count("</b>")
 
 
-@pytest.mark.parametrize("event_type,icon", [("CREATED", "🆕"), ("EDITED", "✏️"), ("DELETED", "🗑️"), ("GHOST_PINGED", "👻")])
-def test_independent_event_notifications(event_type, icon):
-    assert format_event(event(event_type=event_type)).text.startswith(icon)
+@pytest.mark.parametrize("event_type", ["CREATED", "EDITED", "DELETED", "GHOST_PINGED"])
+def test_independent_event_notifications_do_not_add_emoji(event_type):
+    text = format_event(event(event_type=event_type)).text
+    assert text.startswith("<b>&lt;alice&gt;</b> in <b>#&lt;chan&gt;</b>")
 
 
 def test_logger_monitor_icons_exact():

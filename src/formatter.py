@@ -3,13 +3,14 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from .models import FormattedMessage
 
 
-ICONS = {"CREATED": "🆕", "EDITED": "✏️", "DELETED": "🗑️", "GHOST_PINGED": "👻"}
+RICH_HTML_LIMIT = 32768
+EDITORIAL_VISIBLE_THRESHOLD = 1200
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -150,6 +151,28 @@ def _reply(message: dict[str, Any]) -> str:
     return f"\n<blockquote>{_discord_markdown(excerpt)}</blockquote>"
 
 
+def _reply_text(message: dict[str, Any]) -> str:
+    ref: Any = message.get("referenced_message") or message.get("referencedMessage")
+    reference = _dict(message.get("reference"))
+    ref = ref or reference.get("referenced_message") or reference.get("referencedMessage")
+    message_reference = _dict(message.get("message_reference") or message.get("messageReference"))
+    ref = ref or message_reference.get("resolved")
+    ref = _dict(ref)
+    for _ in range(5):
+        nested = next((ref.get(key) for key in ("resolved", "message", "referenced_message", "referencedMessage") if isinstance(ref.get(key), dict)), None)
+        if not isinstance(nested, dict):
+            break
+        ref = nested
+    text = _first(ref, "content")
+    return text[:240] + ("…" if len(text) > 240 else "") if text else ""
+
+
+def _has_reply_reference(message: dict[str, Any]) -> bool:
+    return any(message.get(name) is not None for name in (
+        "referenced_message", "referencedMessage", "reference", "message_reference", "messageReference"
+    ))
+
+
 def _edited(event: dict[str, Any], current: str) -> str:
     history = event.get("editHistory") or event.get("edit_history")
     if not isinstance(history, list) or not history:
@@ -241,13 +264,148 @@ def _sticker_lines(message: dict[str, Any]) -> str:
         if sticker_id:
             host = "media.discordapp.net" if extension == "gif" else "cdn.discordapp.com"
             url = f"https://{host}/stickers/{sticker_id}.{extension}"
-            lines.append(f'🏷️ <a href="{html.escape(url, quote=True)}">{escaped_name}</a>')
+            lines.append(f'<a href="{html.escape(url, quote=True)}">{escaped_name}</a>')
         else:
-            lines.append(f"🏷️ {escaped_name}")
+            lines.append(escaped_name)
     return "\n" + "\n".join(lines) if lines else ""
 
 
-def format_event(event: dict[str, Any]) -> FormattedMessage:
+def _edit_before(event: dict[str, Any], current: str) -> str:
+    history = event.get("editHistory") or event.get("edit_history")
+    if not isinstance(history, list) or not history:
+        history = _dict(event.get("message")).get("editHistory")
+    if isinstance(history, list) and history:
+        previous = history[-1]
+        before = _first(previous, "content", "old_content", "oldContent") if isinstance(previous, dict) else str(previous)
+        if before and before != current:
+            return before
+    return ""
+
+
+def _paragraphs(value: str) -> str:
+    if not value:
+        return ""
+    output: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"```([^\n`]*)\n?(.*?)```", value, re.DOTALL):
+        plain = value[cursor:match.start()]
+        output.extend(f"<p>{_discord_markdown(part)}</p>" for part in re.split(r"\n{2,}", plain) if part)
+        language = match.group(1).strip()
+        language_attribute = f' class="language-{html.escape(language, quote=True)}"' if re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", language) else ""
+        output.append(f"<pre><code{language_attribute}>{html.escape(match.group(2))}</code></pre>")
+        cursor = match.end()
+    plain = value[cursor:]
+    output.extend(f"<p>{_discord_markdown(part)}</p>" for part in re.split(r"\n{2,}", plain) if part)
+    return "".join(output)
+
+
+def _rich_embeds(message: dict[str, Any], content: str) -> str:
+    seen = {content} if content else set()
+    sections: list[str] = []
+
+    def unique(value: Any) -> str:
+        text = "" if value is None else str(value)
+        if not text or text in seen:
+            return ""
+        seen.add(text)
+        return text
+
+    for embed in _embeds(message):
+        parts: list[str] = []
+        author = unique(_dict(embed.get("author")).get("name"))
+        title = unique(embed.get("title"))
+        source = _safe_link(embed.get("url"))
+        heading = title or author
+        if heading:
+            label = html.escape(heading)
+            parts.append(f'<h4><a href="{html.escape(source, quote=True)}">{label}</a></h4>' if source and title else f"<h4>{label}</h4>")
+        if author and title:
+            parts.append(f"<p><i>{html.escape(author)}</i></p>")
+        description = unique(embed.get("description"))
+        if description:
+            parts.append(_paragraphs(description))
+        raw_fields = embed.get("fields")
+        fields = raw_fields if isinstance(raw_fields, list) else list(raw_fields.values()) if isinstance(raw_fields, dict) else []
+        for raw_field in fields[:25]:
+            field = _dict(raw_field)
+            name = unique(field.get("name"))
+            value = unique(field.get("value"))
+            if name:
+                parts.append(f"<p><b>{html.escape(name)}</b></p>")
+            if value:
+                parts.append(_paragraphs(value))
+        footer = unique(_dict(embed.get("footer")).get("text"))
+        if footer:
+            parts.append(f"<p><i>{html.escape(footer)}</i></p>")
+        if source and not title:
+            parts.append(f'<p><a href="{html.escape(source, quote=True)}">Source</a></p>')
+        if parts:
+            sections.append("<hr/>" + "".join(parts))
+    return "".join(sections)
+
+
+_RICH_TOKEN = re.compile(r"<[^>]+>|&(?:amp|lt|gt|quot|#x27);|.", re.DOTALL)
+_RICH_OPEN = re.compile(r"<([a-z][a-z0-9-]*)(?:\s[^>]*)?\s*/?>", re.IGNORECASE)
+_RICH_BLOCK_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "pre", "footer", "hr", "blockquote", "img", "video", "tg-collage"}
+
+
+def truncate_rich_html(value: str, limit: int = RICH_HTML_LIMIT, max_blocks: int = 500) -> str:
+    if limit < 0 or max_blocks < 0:
+        raise ValueError("rich message limits must be nonnegative")
+    value = _sanitize_unicode(value)
+    output: list[str] = []
+    stack: list[str] = []
+    raw_size = 0
+    utf16_size = 0
+    block_count = 0
+    for token in _RICH_TOKEN.findall(value):
+        closing_match = re.fullmatch(r"</([a-z][a-z0-9-]*)>", token, re.IGNORECASE)
+        opening_match = _RICH_OPEN.fullmatch(token)
+        next_stack = stack.copy()
+        if closing_match:
+            tag = closing_match.group(1).lower()
+            if next_stack and next_stack[-1] == tag:
+                next_stack.pop()
+        elif opening_match:
+            tag = opening_match.group(1).lower()
+            if tag in _RICH_BLOCK_TAGS:
+                if block_count >= max_blocks:
+                    return "".join(output) + "".join(f"</{open_tag}>" for open_tag in reversed(stack))
+                block_count += 1
+            if not token.endswith("/>"):
+                next_stack.append(tag)
+        closing = "".join(f"</{tag}>" for tag in reversed(next_stack))
+        suffix = "…" + closing
+        token_raw_size = len(token)
+        token_utf16_size = _utf16_units(token)
+        if raw_size + token_raw_size + len(suffix) > limit or utf16_size + token_utf16_size + _utf16_units(suffix) > limit:
+            return "".join(output) + "…" + "".join(f"</{tag}>" for tag in reversed(stack))
+        output.append(token)
+        raw_size += token_raw_size
+        utf16_size += token_utf16_size
+        stack = next_stack
+    return "".join(output)
+
+
+def _event_metadata(guild: str, event_type: str) -> str:
+    labels = {"EDITED": "Edited", "DELETED": "Deleted", "GHOST_PINGED": "Ghost ping"}
+    label = labels.get(event_type)
+    return html.escape(guild) + (f" · {label}" if label else "")
+
+
+def _style(event: dict[str, Any], message: dict[str, Any], content: str, extracted_media_count: int) -> Literal["compact", "editorial"]:
+    event_type = _first(event, "event_type", default="CREATED")
+    return "editorial" if (
+        _has_reply_reference(message)
+        or bool(_embeds(message))
+        or "```" in content
+        or extracted_media_count >= 2
+        or _utf16_units(_sanitize_unicode(content)) >= EDITORIAL_VISIBLE_THRESHOLD
+        or (event_type == "EDITED" and bool(_edit_before(event, content)))
+    ) else "compact"
+
+
+def format_event(event: dict[str, Any], extracted_media_count: int = 0) -> FormattedMessage:
     message = _dict(event.get("message"))
     event_type = _first(event, "event_type", default="CREATED")
     channel = _first(message, "channel_name", "channelName", default=_first(event, "channel_name", "channelName", default=_first(message, "channel_id", "channelId", default="unknown-channel")))
@@ -256,11 +414,30 @@ def format_event(event: dict[str, Any]) -> FormattedMessage:
     author = _first(message, "author_name", "authorName", default=_first(author_data, "display_name", "displayName", "username", default="Unknown"))
     content = _content(event)
     body = _edited(event, content) if event_type == "EDITED" else _discord_markdown(content)
+    metadata = _event_metadata(guild, event_type)
     text = (
-        f"{ICONS.get(event_type, 'ℹ️')} <b>#{html.escape(channel)}</b> @ {html.escape(guild)}\n"
-        f"👤 {html.escape(author)}\n━━━━━━━━━━\n{body}{_reply(message)}{_sticker_lines(message)}{_embed_lines(message, content)}"
+        f"<b>{html.escape(author)}</b> in <b>#{html.escape(channel)}</b>\n"
+        f"{body}{_reply(message)}{_sticker_lines(message)}{_embed_lines(message, content)}"
+        f"\n<i>{metadata}</i>"
     )
-    return FormattedMessage(truncate_html(text, 4096), truncate_html(text, 1024))
+    classic = FormattedMessage(truncate_html(text, 4096), truncate_html(text, 1024))
+    style = _style(event, message, content, extracted_media_count)
+    if style == "compact":
+        return classic
+    before = _edit_before(event, content)
+    rich_parts = [f"<h3>#{html.escape(channel)}</h3>"]
+    reply = _reply_text(message)
+    if reply:
+        rich_parts.append(f"<blockquote>{_discord_markdown(reply)}</blockquote>")
+    if before:
+        rich_parts.append("<h4>Before</h4>" + _paragraphs(before) + "<h4>After</h4>")
+    rich_parts.append(_paragraphs(content))
+    stickers = _sticker_lines(message).strip()
+    if stickers:
+        rich_parts.append(f"<p>{stickers}</p>")
+    rich_parts.append(_rich_embeds(message, content))
+    rich_parts.append(f"<footer><i>{html.escape(author)} · {metadata}</i></footer>")
+    return FormattedMessage(classic.text, classic.caption, "editorial", truncate_rich_html("".join(rich_parts)))
 
 
 def add_fallbacks(formatted: FormattedMessage, urls: list[str]) -> FormattedMessage:
@@ -282,4 +459,15 @@ def add_fallbacks(formatted: FormattedMessage, urls: list[str]) -> FormattedMess
             return prefix + suffix
         return truncate_html(body, limit)
 
-    return FormattedMessage(append_links(formatted.text, 4096), append_links(formatted.caption, 1024))
+    return FormattedMessage(append_links(formatted.text, 4096), append_links(formatted.caption, 1024), formatted.style, formatted.rich_html)
+
+
+def rich_fallback_html(rich_html: str, urls: list[str]) -> str:
+    unique_urls = list(dict.fromkeys(urls))
+    if not unique_urls:
+        return rich_html
+    links = "".join(
+        f'<p><a href="{html.escape(safe, quote=True)}">Attachment</a></p>' if (safe := _safe_link(url)) else "<p>Attachment unavailable</p>"
+        for url in unique_urls
+    )
+    return truncate_rich_html(rich_html + "<hr/>" + links)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +73,8 @@ class DownloadedMedia:
 class FormattedMessage:
     text: str
     caption: str
+    style: Literal["compact", "editorial"] = "compact"
+    rich_html: str | None = None
 
 
 @dataclass(slots=True)
