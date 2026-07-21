@@ -83,12 +83,12 @@ async def test_prepare_converts_explicit_formatter_rejection_without_swallowing_
             del event
             return [], []
     envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
-    monkeypatch.setattr("src.main.format_event", lambda _event: (_ for _ in ()).throw(EventPreparationError("bad format")))
+    monkeypatch.setattr("src.main.format_event", lambda _event, _media_count=0: (_ for _ in ()).throw(EventPreparationError("bad format")))
     rejected = await prepare_work(WorkItem(envelope), Router(), Media(), None)
     assert isinstance(rejected, RejectedEvent)
     assert rejected.reason == "bad format"
 
-    monkeypatch.setattr("src.main.format_event", lambda _event: (_ for _ in ()).throw(RuntimeError("formatter bug")))
+    monkeypatch.setattr("src.main.format_event", lambda _event, _media_count=0: (_ for _ in ()).throw(RuntimeError("formatter bug")))
     with pytest.raises(RuntimeError, match="formatter bug"):
         await prepare_work(WorkItem(envelope), Router(), Media(), None)
 

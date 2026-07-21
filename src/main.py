@@ -101,8 +101,8 @@ async def prepare_work(work: WorkItem, router: EventRouter, media: EventMedia, i
         return envelope
     try:
         targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(envelope.event)
-        formatted = format_event(envelope.event)
         attachments = extract_attachments(envelope.event)
+        formatted = format_event(envelope.event, len(attachments))
     except EventPreparationError as exc:
         return RejectedEvent(envelope.cursor, envelope.event, str(exc))
     all_urls = [item.url for item in attachments]
@@ -144,7 +144,7 @@ async def run() -> None:
     ):
         bridge = BridgeClient(config.bridge_url, config.bridge_token, bridge_http, config.queue_size)
         media = MediaHandler(media_http, config.media_max_bytes, config.media_timeout_s, config.media_max_attachments, config.media_max_total_bytes)
-        sender = TgSender(config.tg_token, telegram_http, state, config.telegram_global_per_s, config.telegram_chat_per_min)
+        sender = TgSender(config.tg_token, telegram_http, state, config.telegram_global_per_s, config.telegram_chat_per_min, rich_messages_enabled=config.rich_messages_enabled)
         work_queue: asyncio.Queue[WorkItem] = asyncio.Queue(config.queue_size)
         prepared_queue: asyncio.Queue[PreparedEvent | RejectedEvent] = asyncio.Queue(config.prepared_queue_size)
         pending = PendingCursors()
