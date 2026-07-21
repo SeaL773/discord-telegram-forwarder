@@ -77,9 +77,9 @@ class StateStore:
             raise ValueError("invalid target")
         if target.get("status") not in {"pending", "sent", "dead_lettered"}:
             raise ValueError("invalid target status")
-        if target.get("phase", "media") not in {"media", "fallback"}:
+        if target.get("phase", "media") not in {"rich", "media", "fallback"}:
             raise ValueError("invalid target phase")
-        for name in ("retries", "fallback_retries"):
+        for name in ("rich_retries", "retries", "fallback_retries"):
             value = target.get(name, 0)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError("invalid retry count")
@@ -207,14 +207,16 @@ class StateStore:
             self.data["bootstrap"] = {"ready_cursor": ready_cursor, "next_index": 0, "items": items}
             await self._persist()
 
-    async def begin(self, envelope: Envelope, targets: list[Target]) -> None:
+    async def begin(self, envelope: Envelope, targets: list[Target], initial_phase: str = "media") -> None:
+        if initial_phase not in {"rich", "media", "fallback"}:
+            raise ValueError("invalid initial target phase")
         async with self._lock:
             if self.data["in_flight"] is not None:
                 raise RuntimeError("in-flight event already exists")
             self.data["in_flight"] = {
                 "cursor": envelope.cursor,
                 "event": envelope.event,
-                "targets": [{"chat_id": t.chat_id, "thread_id": t.thread_id, "status": "pending", "phase": "media", "retries": 0, "fallback_retries": 0} for t in targets],
+                "targets": [{"chat_id": t.chat_id, "thread_id": t.thread_id, "status": "pending", "phase": initial_phase, "rich_retries": 0, "retries": 0, "fallback_retries": 0} for t in targets],
             }
             await self._persist()
 
@@ -227,10 +229,12 @@ class StateStore:
             raise IndexError("target index out of bounds")
         return targets[target_index]
 
-    async def retry(self, target_index: int, *, fallback: bool = False) -> None:
+    async def retry(self, target_index: int, *, fallback: bool = False, rich: bool = False) -> None:
+        if fallback and rich:
+            raise ValueError("retry phase is ambiguous")
         async with self._lock:
             target = self._target(target_index)
-            key = "fallback_retries" if fallback else "retries"
+            key = "fallback_retries" if fallback else "rich_retries" if rich else "retries"
             target[key] = int(target.get(key, 0)) + 1
             await self._persist()
 
@@ -241,6 +245,19 @@ class StateStore:
                 raise RuntimeError("terminal target cannot enter fallback")
             target["phase"] = "fallback"
             await self._persist()
+
+    async def set_media(self, target_index: int) -> None:
+        async with self._lock:
+            target = self._target(target_index)
+            if target["status"] != "pending":
+                raise RuntimeError("terminal target cannot enter media")
+            previous = target.get("phase", "media")
+            target["phase"] = "media"
+            try:
+                await self._persist()
+            except BaseException:
+                target["phase"] = previous
+                raise
 
     async def terminal(self, target_index: int, status: str) -> None:
         if status not in {"sent", "dead_lettered"}:

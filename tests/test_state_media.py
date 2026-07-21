@@ -31,6 +31,32 @@ async def test_state_atomic_fanout_restart_and_dead_letter_order(tmp_path: Path)
     assert persisted["last_acked_cursor"] == "cursor" and persisted["in_flight"] is None
 
 
+@pytest.mark.asyncio
+async def test_rich_retry_counter_and_phase_survive_restart(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")], "rich")
+    await state.retry(0, rich=True)
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.in_flight is not None
+    assert restarted.in_flight["targets"][0]["phase"] == "rich"
+    assert restarted.in_flight["targets"][0]["rich_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_set_media_persist_failure_rolls_back_rich_phase(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")], "rich")
+
+    async def fail_persist():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError, match="disk full"):
+        await state.set_media(0)
+    assert state.in_flight is not None and state.in_flight["targets"][0]["phase"] == "rich"
+
+
 def target_dead_letter_record(cursor="cursor", chat_id="1"):
     return {"cursor": cursor, "event": {"message": {"content": "payload"}}, "target": {"chat_id": chat_id, "thread_id": None}, "reason": "http_400"}
 
