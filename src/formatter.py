@@ -82,23 +82,43 @@ def _discord_markdown(value: str, *, repair_embed: bool = False) -> str:
 
 
 _BOLD_DELIMITER = re.compile(r"(?<!\*)\*\*(?!\*)")
+_BOLD_OPENING = re.compile(r"^[ \t]*\*\*(?!\*)")
+_BOLD_CLOSING = re.compile(r"(?<!\*)\*\*[ \t]*$")
 
 
 def _pair_embed_paragraph_bold(value: str) -> str:
-    delimiters = list(_BOLD_DELIMITER.finditer(value))
+    parts = re.split(r"(\n{2,})", value)
+    for opening_index in range(0, len(parts), 2):
+        opening_part = parts[opening_index]
+        if len(_BOLD_DELIMITER.findall(opening_part)) != 1 or _BOLD_OPENING.search(opening_part) is None:
+            continue
+        closing_index: int | None = None
+        for candidate_index in range(opening_index + 2, len(parts), 2):
+            candidate = parts[candidate_index]
+            delimiter_count = len(_BOLD_DELIMITER.findall(candidate))
+            if delimiter_count == 0:
+                continue
+            if delimiter_count == 1 and _BOLD_CLOSING.search(candidate) is not None:
+                closing_index = candidate_index
+            break
+        if closing_index is None:
+            continue
+        parts[opening_index] = _BOLD_OPENING.sub("", parts[opening_index], count=1)
+        parts[closing_index] = _BOLD_CLOSING.sub("", parts[closing_index], count=1)
+        for paragraph_index in range(opening_index, closing_index + 1, 2):
+            if parts[paragraph_index]:
+                parts[paragraph_index] = f"**{parts[paragraph_index]}**"
+    return "".join(parts)
+
+
+def _classic_embed_markdown(value: str) -> str:
     output: list[str] = []
     cursor = 0
-    for index in range(0, len(delimiters) - 1, 2):
-        opening = delimiters[index]
-        closing = delimiters[index + 1]
-        content = value[opening.end():closing.start()]
-        if re.search(r"\n{2,}", content) is None:
-            continue
-        parts = re.split(r"(\n{2,})", content)
-        paired = "".join(part if part_index % 2 or not part else f"**{part}**" for part_index, part in enumerate(parts))
-        output.extend((value[cursor:opening.start()], paired))
-        cursor = closing.end()
-    output.append(value[cursor:])
+    for match in re.finditer(r"```[^\n`]*\n?.*?```", value, re.DOTALL):
+        output.append(_discord_markdown(value[cursor:match.start()], repair_embed=True))
+        output.append(html.escape(match.group(0)))
+        cursor = match.end()
+    output.append(_discord_markdown(value[cursor:], repair_embed=True))
     return "".join(output)
 
 
@@ -107,7 +127,9 @@ def _telegram_hashtag(value: str) -> str:
     separator = False
     for character in unicodedata.normalize("NFKC", value).strip():
         category = unicodedata.category(character)
-        if character == "_" or category[0] in {"L", "M", "N"}:
+        if character == "_":
+            separator = True
+        elif category[0] in {"L", "M", "N"}:
             if separator and output and output[-1] != "_":
                 output.append("_")
             output.append(character)
@@ -149,7 +171,7 @@ def _embed_lines(message: dict[str, Any], content: str) -> str:
 
         description = unique_text(embed.get("description"))
         if description:
-            lines.append(_discord_markdown(description, repair_embed=True))
+            lines.append(_classic_embed_markdown(description))
 
         raw_fields = embed.get("fields")
         fields = raw_fields if isinstance(raw_fields, list) else list(raw_fields.values()) if isinstance(raw_fields, dict) else []
@@ -158,11 +180,11 @@ def _embed_lines(message: dict[str, Any], content: str) -> str:
             name = unique_text(field.get("name"))
             value = unique_text(field.get("value"))
             if name and value:
-                lines.append(f"<b>{html.escape(name)}</b>\n{_discord_markdown(value, repair_embed=True)}")
+                lines.append(f"<b>{html.escape(name)}</b>\n{_classic_embed_markdown(value)}")
             elif name:
                 lines.append(f"<b>{html.escape(name)}</b>")
             elif value:
-                lines.append(_discord_markdown(value, repair_embed=True))
+                lines.append(_classic_embed_markdown(value))
 
         footer = unique_text(_dict(embed.get("footer")).get("text"))
         if footer:

@@ -244,6 +244,19 @@ def test_embed_markdown_repairs_cross_paragraph_bold_and_orphan_closer():
     assert separate.rich_html is not None
     assert "<p><b>First</b></p><p><b>Second</b></p>" in separate.rich_html
 
+    value["message"]["embeds"] = [{"description": "orphan **\n\n**First**"}]
+    leading_orphan = format_event(value)
+    assert leading_orphan.rich_html is not None
+    assert "orphan **" not in leading_orphan.rich_html
+    assert "<p><b>First</b></p>" in leading_orphan.rich_html
+
+    value["message"]["embeds"] = [{"description": "```py\n**code\n\nmore**\n```"}]
+    code = format_event(value)
+    assert "```py\n**code\n\nmore**\n```" in code.text
+    assert "<b>code" not in code.text
+    assert code.rich_html is not None
+    assert "<pre><code class=\"language-py\">**code\n\nmore**\n</code></pre>" in code.rich_html
+
 
 def test_channel_hashtag_normalizes_separators_and_preserves_unicode():
     value = event("short")
@@ -256,6 +269,11 @@ def test_channel_hashtag_normalizes_separators_and_preserves_unicode():
     editorial = format_event(value)
     assert editorial.rich_html is not None
     assert editorial.rich_html.startswith("<h3>#推荐_bishop_期权_日内</h3>")
+
+    value["message"]["channel_name"] = "Cafe\u0301---___／／beta   gamma"
+    normalized = format_event(value)
+    assert normalized.rich_html is not None
+    assert normalized.rich_html.startswith("<h3>#Café_beta_gamma</h3>")
 
 
 def test_markdown_tags_remain_balanced_at_utf16_truncation_boundary():
