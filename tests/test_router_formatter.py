@@ -259,6 +259,18 @@ def test_embed_markdown_repairs_cross_paragraph_bold_and_orphan_closer():
     assert "<b>First</b>" in odd_mix.text and "<b>Second</b>" in odd_mix.text
     assert "<p><b>First</b></p><p><b>Second</b></p>" in odd_mix.rich_html
 
+    value["message"]["embeds"] = [{"description": "orphan **\n**First**"}]
+    single_newline_orphan = format_event(value)
+    assert single_newline_orphan.rich_html is not None
+    assert "orphan **" not in single_newline_orphan.text and "orphan **" not in single_newline_orphan.rich_html
+    assert "<b>First</b>" in single_newline_orphan.text and "<b>First</b>" in single_newline_orphan.rich_html
+
+    value["message"]["embeds"] = [{"description": "**First line\nSecond line**"}]
+    single_newline_bold = format_event(value)
+    assert single_newline_bold.rich_html is not None
+    assert "<b>First line</b>\n<b>Second line</b>" in single_newline_bold.text
+    assert "<p><b>First line</b>\n<b>Second line</b></p>" in single_newline_bold.rich_html
+
     value["message"]["embeds"] = [{"description": "```py\n**code\n\nmore**\n```"}]
     code = format_event(value)
     assert "```py\n**code\n\nmore**\n```" in code.text

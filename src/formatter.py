@@ -66,9 +66,8 @@ def _safe_link(value: Any) -> str:
 
 def _discord_markdown(value: str, *, repair_embed: bool = False) -> str:
     escaped = html.escape(value)
-    emphasis_body = r"[^*]+?" if repair_embed else r"[^*\n]+?"
-    escaped = re.sub(rf"\*\*\*({emphasis_body})\*\*\*", r"<b><i>\1</i></b>", escaped)
-    escaped = re.sub(rf"\*\*({emphasis_body})\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"\*\*\*([^*\n]+?)\*\*\*", r"<b><i>\1</i></b>", escaped)
+    escaped = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", escaped)
     if repair_embed:
         escaped = re.sub(r"(?m)^\*\*(?!\*)", "", escaped)
@@ -86,7 +85,7 @@ _BOLD_CLOSING = re.compile(r"(?<!\*)\*\*[ \t]*$")
 
 
 def _pair_embed_paragraph_bold(value: str) -> str:
-    parts = re.split(r"(\n{2,})", value)
+    parts = re.split(r"(\n+)", value)
     for opening_index in range(0, len(parts), 2):
         opening_part = parts[opening_index]
         if len(_BOLD_DELIMITER.findall(opening_part)) != 1 or _BOLD_OPENING.search(opening_part) is None:
