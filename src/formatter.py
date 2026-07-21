@@ -64,16 +64,58 @@ def _safe_link(value: Any) -> str:
     return value
 
 
-def _discord_markdown(value: str) -> str:
+def _discord_markdown(value: str, *, repair_embed: bool = False) -> str:
     escaped = html.escape(value)
-    escaped = re.sub(r"\*\*\*([^*\n]+?)\*\*\*", r"<b><i>\1</i></b>", escaped)
-    escaped = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", escaped)
+    emphasis_body = r"[^*]+?" if repair_embed else r"[^*\n]+?"
+    escaped = re.sub(rf"\*\*\*({emphasis_body})\*\*\*", r"<b><i>\1</i></b>", escaped)
+    escaped = re.sub(rf"\*\*({emphasis_body})\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", escaped)
+    if repair_embed:
+        escaped = re.sub(r"(?m)^\*\*(?=[ \t])", "", escaped)
+        escaped = re.sub(r"(?m)(?<=[ \t])\*\*$", "", escaped)
+        escaped = re.sub(r"(?m)^\*\*$", "", escaped)
     lines: list[str] = []
     for line in escaped.split("\n"):
         heading = re.fullmatch(r"#{1,6}[ \t]+(.+)", line)
         lines.append(f"<b>{heading.group(1)}</b>" if heading else line)
     return "\n".join(lines)
+
+
+_BOLD_DELIMITER = re.compile(r"(?<!\*)\*\*(?!\*)")
+
+
+def _pair_embed_paragraph_bold(value: str) -> str:
+    delimiters = list(_BOLD_DELIMITER.finditer(value))
+    output: list[str] = []
+    cursor = 0
+    for index in range(0, len(delimiters) - 1, 2):
+        opening = delimiters[index]
+        closing = delimiters[index + 1]
+        content = value[opening.end():closing.start()]
+        if re.search(r"\n{2,}", content) is None:
+            continue
+        parts = re.split(r"(\n{2,})", content)
+        paired = "".join(part if part_index % 2 or not part else f"**{part}**" for part_index, part in enumerate(parts))
+        output.extend((value[cursor:opening.start()], paired))
+        cursor = closing.end()
+    output.append(value[cursor:])
+    return "".join(output)
+
+
+def _telegram_hashtag(value: str) -> str:
+    output: list[str] = []
+    separator = False
+    for character in unicodedata.normalize("NFKC", value).strip():
+        category = unicodedata.category(character)
+        if character == "_" or category[0] in {"L", "M", "N"}:
+            if separator and output and output[-1] != "_":
+                output.append("_")
+            output.append(character)
+            separator = False
+        else:
+            separator = True
+    slug = "".join(output).strip("_")
+    return slug if slug and not slug.isdecimal() else "channel"
 
 
 def _embed_lines(message: dict[str, Any], content: str) -> str:
@@ -107,7 +149,7 @@ def _embed_lines(message: dict[str, Any], content: str) -> str:
 
         description = unique_text(embed.get("description"))
         if description:
-            lines.append(_discord_markdown(description))
+            lines.append(_discord_markdown(description, repair_embed=True))
 
         raw_fields = embed.get("fields")
         fields = raw_fields if isinstance(raw_fields, list) else list(raw_fields.values()) if isinstance(raw_fields, dict) else []
@@ -116,11 +158,11 @@ def _embed_lines(message: dict[str, Any], content: str) -> str:
             name = unique_text(field.get("name"))
             value = unique_text(field.get("value"))
             if name and value:
-                lines.append(f"<b>{html.escape(name)}</b>\n{_discord_markdown(value)}")
+                lines.append(f"<b>{html.escape(name)}</b>\n{_discord_markdown(value, repair_embed=True)}")
             elif name:
                 lines.append(f"<b>{html.escape(name)}</b>")
             elif value:
-                lines.append(_discord_markdown(value))
+                lines.append(_discord_markdown(value, repair_embed=True))
 
         footer = unique_text(_dict(embed.get("footer")).get("text"))
         if footer:
@@ -282,20 +324,24 @@ def _edit_before(event: dict[str, Any], current: str) -> str:
     return ""
 
 
-def _paragraphs(value: str) -> str:
+def _paragraphs(value: str, *, repair_embed: bool = False) -> str:
     if not value:
         return ""
     output: list[str] = []
     cursor = 0
     for match in re.finditer(r"```([^\n`]*)\n?(.*?)```", value, re.DOTALL):
         plain = value[cursor:match.start()]
-        output.extend(f"<p>{_discord_markdown(part)}</p>" for part in re.split(r"\n{2,}", plain) if part)
+        if repair_embed:
+            plain = _pair_embed_paragraph_bold(plain)
+        output.extend(f"<p>{_discord_markdown(part, repair_embed=repair_embed)}</p>" for part in re.split(r"\n{2,}", plain) if part)
         language = match.group(1).strip()
         language_attribute = f' class="language-{html.escape(language, quote=True)}"' if re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", language) else ""
         output.append(f"<pre><code{language_attribute}>{html.escape(match.group(2))}</code></pre>")
         cursor = match.end()
     plain = value[cursor:]
-    output.extend(f"<p>{_discord_markdown(part)}</p>" for part in re.split(r"\n{2,}", plain) if part)
+    if repair_embed:
+        plain = _pair_embed_paragraph_bold(plain)
+    output.extend(f"<p>{_discord_markdown(part, repair_embed=repair_embed)}</p>" for part in re.split(r"\n{2,}", plain) if part)
     return "".join(output)
 
 
@@ -323,7 +369,7 @@ def _rich_embeds(message: dict[str, Any], content: str) -> str:
             parts.append(f"<p><i>{html.escape(author)}</i></p>")
         description = unique(embed.get("description"))
         if description:
-            parts.append(_paragraphs(description))
+            parts.append(_paragraphs(description, repair_embed=True))
         raw_fields = embed.get("fields")
         fields = raw_fields if isinstance(raw_fields, list) else list(raw_fields.values()) if isinstance(raw_fields, dict) else []
         for raw_field in fields[:25]:
@@ -333,7 +379,7 @@ def _rich_embeds(message: dict[str, Any], content: str) -> str:
             if name:
                 parts.append(f"<p><b>{html.escape(name)}</b></p>")
             if value:
-                parts.append(_paragraphs(value))
+                parts.append(_paragraphs(value, repair_embed=True))
         footer = unique(_dict(embed.get("footer")).get("text"))
         if footer:
             parts.append(f"<p><i>{html.escape(footer)}</i></p>")
@@ -413,10 +459,11 @@ def format_event(event: dict[str, Any], extracted_media_count: int = 0) -> Forma
     author_data = _dict(message.get("author"))
     author = _first(message, "author_name", "authorName", default=_first(author_data, "display_name", "displayName", "username", default="Unknown"))
     content = _content(event)
+    channel_hashtag = _telegram_hashtag(channel)
     body = _edited(event, content) if event_type == "EDITED" else _discord_markdown(content)
     metadata = _event_metadata(guild, event_type)
     text = (
-        f"<b>{html.escape(author)}</b> in <b>#{html.escape(channel)}</b>\n"
+        f"<b>{html.escape(author)}</b> in <b>#{channel_hashtag}</b>\n"
         f"{body}{_reply(message)}{_sticker_lines(message)}{_embed_lines(message, content)}"
         f"\n<i>{metadata}</i>"
     )
@@ -425,7 +472,7 @@ def format_event(event: dict[str, Any], extracted_media_count: int = 0) -> Forma
     if style == "compact":
         return classic
     before = _edit_before(event, content)
-    rich_parts = [f"<h3>#{html.escape(channel)}</h3>"]
+    rich_parts = [f"<h3>#{channel_hashtag}</h3>"]
     reply = _reply_text(message)
     if reply:
         rich_parts.append(f"<blockquote>{_discord_markdown(reply)}</blockquote>")

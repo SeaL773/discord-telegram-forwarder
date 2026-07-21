@@ -123,7 +123,7 @@ def test_formatter_escapes_edit_history_reply_and_bounds():
     value["editHistory"] = [{"content": "old & bad"}]
     value["message"]["referencedMessage"] = {"resolved": {"content": "quoted <x>"}}
     formatted = format_event(value)
-    assert "#&lt;chan&gt;" in formatted.text
+    assert "#chan" in formatted.text
     assert "A&amp;B" in formatted.text
     assert "&lt;alice&gt;" in formatted.text
     assert "old &amp; bad" in formatted.text and "new &lt;b&gt;" in formatted.text
@@ -157,7 +157,7 @@ def test_realistic_upstream_shape_uses_id_fallbacks_and_renders_stickers():
         },
     }
     text = format_event(value).text
-    assert "#channel-123" in text and "<i>guild-456</i>" in text and "<i>DM</i>" not in text
+    assert "#channel_123" in text and "<i>guild-456</i>" in text and "<i>DM</i>" not in text
     assert "collector-user" in text and "wave &lt;hello&gt;" in text
     assert "https://cdn.discordapp.com/stickers/1.png" in text
     assert "https://cdn.discordapp.com/stickers/2.png" in text
@@ -223,6 +223,39 @@ def test_discord_markdown_headings_bold_italic_and_html_are_safe():
     assert "<b>Educational only.</b>" in formatted.text
     assert "Market &lt;structure&gt; shifted." in formatted.text
     assert "###" not in formatted.text and "***" not in formatted.text
+
+
+def test_embed_markdown_repairs_cross_paragraph_bold_and_orphan_closer():
+    value = event("ordinary text **")
+    value["message"]["embeds"] = [{
+        "description": "**First paragraph\n\nSecond paragraph\n\nThird paragraph**",
+        "fields": [{"name": "Translation", "value": "Translated risk rule **"}],
+    }]
+    formatted = format_event(value)
+    assert "<b>First paragraph\n\nSecond paragraph\n\nThird paragraph</b>" in formatted.text
+    assert "Translated risk rule **" not in formatted.text
+    assert "ordinary text **" in formatted.text
+    assert formatted.rich_html is not None
+    assert "<p><b>First paragraph</b></p><p><b>Second paragraph</b></p><p><b>Third paragraph</b></p>" in formatted.rich_html
+    assert "Translated risk rule **" not in formatted.rich_html
+
+    value["message"]["embeds"] = [{"description": "**First**\n\n**Second**"}]
+    separate = format_event(value)
+    assert separate.rich_html is not None
+    assert "<p><b>First</b></p><p><b>Second</b></p>" in separate.rich_html
+
+
+def test_channel_hashtag_normalizes_separators_and_preserves_unicode():
+    value = event("short")
+    value["message"]["channel_name"] = "推荐--bishop／期权 日内"
+    compact = format_event(value)
+    assert "#推荐_bishop_期权_日内" in compact.text
+    assert "#推荐--bishop" not in compact.text
+
+    value["message"]["embeds"] = [{"title": "Card"}]
+    editorial = format_event(value)
+    assert editorial.rich_html is not None
+    assert editorial.rich_html.startswith("<h3>#推荐_bishop_期权_日内</h3>")
 
 
 def test_markdown_tags_remain_balanced_at_utf16_truncation_boundary():
@@ -388,7 +421,7 @@ def test_embed_dict_shape_caps_embeds_fields_and_keeps_caption_utf16_safe():
 @pytest.mark.parametrize("event_type", ["CREATED", "EDITED", "DELETED", "GHOST_PINGED"])
 def test_independent_event_notifications_do_not_add_emoji(event_type):
     text = format_event(event(event_type=event_type)).text
-    assert text.startswith("<b>&lt;alice&gt;</b> in <b>#&lt;chan&gt;</b>")
+    assert text.startswith("<b>&lt;alice&gt;</b> in <b>#chan</b>")
 
 
 def test_logger_monitor_icons_exact():
