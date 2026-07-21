@@ -232,7 +232,7 @@ def test_embed_markdown_repairs_cross_paragraph_bold_and_orphan_closer():
         "fields": [{"name": "Translation", "value": "Translated risk rule **"}],
     }]
     formatted = format_event(value)
-    assert "<b>First paragraph\n\nSecond paragraph\n\nThird paragraph</b>" in formatted.text
+    assert "<b>First paragraph</b>\n\n<b>Second paragraph</b>\n\n<b>Third paragraph</b>" in formatted.text
     assert "Translated risk rule **" not in formatted.text
     assert "ordinary text **" in formatted.text
     assert formatted.rich_html is not None
@@ -249,6 +249,15 @@ def test_embed_markdown_repairs_cross_paragraph_bold_and_orphan_closer():
     assert leading_orphan.rich_html is not None
     assert "orphan **" not in leading_orphan.rich_html
     assert "<p><b>First</b></p>" in leading_orphan.rich_html
+    assert "orphan **" not in leading_orphan.text
+    assert "<b>First</b>" in leading_orphan.text
+
+    value["message"]["embeds"] = [{"description": "**orphan\n\nplain\n\n**First**\n\n**Second**"}]
+    odd_mix = format_event(value)
+    assert odd_mix.rich_html is not None
+    assert "**orphan" not in odd_mix.text and "**orphan" not in odd_mix.rich_html
+    assert "<b>First</b>" in odd_mix.text and "<b>Second</b>" in odd_mix.text
+    assert "<p><b>First</b></p><p><b>Second</b></p>" in odd_mix.rich_html
 
     value["message"]["embeds"] = [{"description": "```py\n**code\n\nmore**\n```"}]
     code = format_event(value)

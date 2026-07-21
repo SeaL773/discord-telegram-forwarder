@@ -71,9 +71,8 @@ def _discord_markdown(value: str, *, repair_embed: bool = False) -> str:
     escaped = re.sub(rf"\*\*({emphasis_body})\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", escaped)
     if repair_embed:
-        escaped = re.sub(r"(?m)^\*\*(?=[ \t])", "", escaped)
-        escaped = re.sub(r"(?m)(?<=[ \t])\*\*$", "", escaped)
-        escaped = re.sub(r"(?m)^\*\*$", "", escaped)
+        escaped = re.sub(r"(?m)^\*\*(?!\*)", "", escaped)
+        escaped = re.sub(r"(?m)(?<!\*)\*\*$", "", escaped)
     lines: list[str] = []
     for line in escaped.split("\n"):
         heading = re.fullmatch(r"#{1,6}[ \t]+(.+)", line)
@@ -112,13 +111,20 @@ def _pair_embed_paragraph_bold(value: str) -> str:
 
 
 def _classic_embed_markdown(value: str) -> str:
+    def plain_markdown(plain: str) -> str:
+        repaired = _pair_embed_paragraph_bold(plain)
+        return "".join(
+            part if index % 2 else _discord_markdown(part, repair_embed=True)
+            for index, part in enumerate(re.split(r"(\n{2,})", repaired))
+        )
+
     output: list[str] = []
     cursor = 0
     for match in re.finditer(r"```[^\n`]*\n?.*?```", value, re.DOTALL):
-        output.append(_discord_markdown(value[cursor:match.start()], repair_embed=True))
+        output.append(plain_markdown(value[cursor:match.start()]))
         output.append(html.escape(match.group(0)))
         cursor = match.end()
-    output.append(_discord_markdown(value[cursor:], repair_embed=True))
+    output.append(plain_markdown(value[cursor:]))
     return "".join(output)
 
 
