@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import websockets
 
-from .models import Envelope, RejectedEvent
+from .models import Envelope, RejectedEvent, Target
 from . import LoggerManager
 
 
@@ -126,16 +126,29 @@ class BridgeClient:
             events = events[: boundary + 1]
         keep: set[str] = set()
         by_channel: dict[str, list[Envelope]] = {}
+        targets_by_cursor: dict[str, list[Target]] = {}
         for envelope in events:
             if isinstance(envelope, RejectedEvent):
                 continue
-            if snapshot.route(envelope.event):
+            targets = snapshot.route(envelope.event)
+            targets_by_cursor[envelope.cursor] = targets
+            if targets:
                 message = envelope.event.get("message", {})
                 channel = str(message.get("channel_id") or message.get("channelId") or "") if isinstance(message, dict) else ""
                 by_channel.setdefault(channel, []).append(envelope)
         for values in by_channel.values():
             keep.update(item.cursor for item in values[-10:])
-        return [{"cursor": item.cursor, "event": item.event, "targets": [{"chat_id": target.chat_id, "thread_id": target.thread_id} for target in snapshot.route(item.event)] if isinstance(item, Envelope) and item.cursor in keep else [], **({"rejection_reason": item.reason} if isinstance(item, RejectedEvent) else {})} for item in events]
+        plan: list[dict[str, Any]] = []
+        for item in events:
+            if isinstance(item, RejectedEvent):
+                plan.append({"cursor": item.cursor, "event": item.event, "targets": [], "rejection_reason": item.reason})
+                continue
+            targets = targets_by_cursor.get(item.cursor, [])
+            if item.cursor not in keep or not targets:
+                plan.append({"cursor": item.cursor, "action": "drop"})
+                continue
+            plan.append({"cursor": item.cursor, "event": item.event, "targets": [{"chat_id": target.chat_id, "thread_id": target.thread_id} for target in targets]})
+        return plan
 
     async def capture_bootstrap(self, snapshot: Any, on_ready: Callable[[], None] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
         queue: asyncio.Queue[Envelope | RejectedEvent] = asyncio.Queue(self.buffer_size)
@@ -184,6 +197,8 @@ class BridgeClient:
             ready_cursor = self._parse_ready(await ws.recv())
             if on_ready is not None:
                 on_ready()
+            if ack is not None and ready_cursor is None:
+                raise SessionLost("bridge ready boundary missing for durable cursor")
             self.connected = True
             reader = asyncio.create_task(self._reader(ws, queue))
             replay: list[Envelope | RejectedEvent] = []
@@ -194,8 +209,11 @@ class BridgeClient:
                     elif ack is None:
                         raise SessionLost("bootstrap boundary appeared; restart bootstrap")
                     else:
-                        replay = [item async for item in self.rest_pages(ack)]
-                        if ready_cursor is not None and all(item.cursor != ready_cursor for item in replay):
+                        async for item in self.rest_pages(ack):
+                            replay.append(item)
+                            if ready_cursor is not None and item.cursor == ready_cursor:
+                                break
+                        if ready_cursor is not None and (not replay or replay[-1].cursor != ready_cursor):
                             raise SessionLost("REST replay missed ready boundary")
                 except CursorExpired:
                     await on_gap(ready_cursor)

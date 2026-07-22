@@ -44,19 +44,24 @@ class FakeConnect:
 @pytest.mark.asyncio
 async def test_ws_reader_starts_before_rest_ready_overlap_once():
     ws = FakeWs([frame("r2"), frame("live")])
+    replay_continued_past_ready = False
     async with httpx.AsyncClient() as client:
         bridge = BridgeClient("http://bridge", "token", client, connector=FakeConnect(ws))
         async def pages(after, *, snapshot=False):
+            nonlocal replay_continued_past_ready
             assert after == "old" and snapshot is False
             assert ws.ready_sent
             await asyncio.sleep(0)
             yield Envelope("r1", frame("r1")["event"])
             yield Envelope("r2", frame("r2")["event"])
+            replay_continued_past_ready = True
+            raise AssertionError("REST replay continued past ready boundary")
         bridge.rest_pages = pages
         stream = bridge.session("old", parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
         result = [await anext(stream), await anext(stream), await anext(stream)]
         await stream.aclose()
     assert [x.cursor for x in result] == ["r1", "r2", "live"]
+    assert replay_continued_past_ready is False
     assert bridge.connector.kwargs["proxy"] is None
 
 
@@ -109,6 +114,21 @@ async def test_null_bootstrap_race_restarts_when_next_ready_is_non_null():
         bridge = BridgeClient("http://bridge", "token", client, connector=FakeConnect(ws))
         stream = bridge.session(None, parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
         with pytest.raises(SessionLost, match="restart bootstrap"):
+            await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_durable_ack_rejects_null_ready_boundary_without_rest():
+    ws = FakeWs([])
+    ws.ready = json.dumps({"type": "ready", "latest_cursor": None})
+    async with httpx.AsyncClient() as client:
+        bridge = BridgeClient("http://bridge", "token", client, connector=FakeConnect(ws))
+        async def pages(after, *, snapshot=False):
+            assert after != "durable" and snapshot is False, "REST must not run without a ready boundary"
+            yield Envelope("never", frame("never")["event"])
+        bridge.rest_pages = pages
+        stream = bridge.session("durable", parse_rules({"rules": [], "default_action": "drop"}), lambda cursor: asyncio.sleep(0))
+        with pytest.raises(SessionLost, match="ready boundary missing"):
             await anext(stream)
 
 
@@ -293,15 +313,31 @@ def test_ready_resets_reconnect_backoff_immediately_but_invalid_ready_does_not()
 async def test_bootstrap_complete_snapshot_newest_ten_actual_channel_and_drops():
     events = [Envelope(str(i), {"event_type": "CREATED", "message": {"channel_id": "a" if i < 12 else "b", "content": "x"}}) for i in range(15)]
     rules = parse_rules({"rules": [{"match": {"channel_id": "a"}, "forward_to": {"chat_id": "1"}}], "default_action": "drop"})
+    route_calls = 0
+
+    class Snapshot:
+        def route(self, event):
+            nonlocal route_calls
+            route_calls += 1
+            return rules.route(event)
+
     async with httpx.AsyncClient() as client:
         bridge = BridgeClient("http://bridge", "token", client)
         async def pages(after, *, snapshot=False):
             assert after is None and snapshot is True
             for item in events: yield item
         bridge.rest_pages = pages
-        result = await bridge.bootstrap("14", rules)
+        result = await bridge.bootstrap("14", Snapshot())
+    assert route_calls == len(events)
     assert [x["cursor"] for x in result] == [str(i) for i in range(15)]
-    assert [x["cursor"] for x in result if x["targets"]] == [str(i) for i in range(2, 12)]
+    assert [x["cursor"] for x in result if x.get("targets")] == [str(i) for i in range(2, 12)]
+    assert result[:2] == [{"cursor": "0", "action": "drop"}, {"cursor": "1", "action": "drop"}]
+    assert result[12:] == [
+        {"cursor": "12", "action": "drop"},
+        {"cursor": "13", "action": "drop"},
+        {"cursor": "14", "action": "drop"},
+    ]
+    assert all("event" in item and item["targets"] for item in result[2:12])
 
 
 @pytest.mark.asyncio
