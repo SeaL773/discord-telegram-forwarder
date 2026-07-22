@@ -19,7 +19,7 @@ The deployment has three independently managed components:
 - Windows Discord Stable.
 - Node.js 20 or newer and pnpm.
 - Git.
-- Docker Desktop with Docker Compose 2.24.0 or newer.
+- Docker Desktop with Docker Compose 2.35.0 or newer.
 - A Telegram bot token and the numeric chat IDs used for alerts and forwarding.
 - Authorization to collect and forward messages from every selected Discord
   channel.

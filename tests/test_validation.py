@@ -64,6 +64,7 @@ def test_dead_letter_retention_config_defaults_and_values(tmp_path: Path, monkey
     default = load_config(default_path)
     assert default.dead_letter_max_bytes == 32 * 1024 * 1024
     assert default.dead_letter_backup_count == 2
+    assert default.prepared_queue_size == 1
 
     configured_path = tmp_path / "configured.yaml"
     configured_path.write_text("admin_chat_id: '-1001'\nstate: {dead_letter_max_bytes: 16777216, dead_letter_backup_count: 4}\n", encoding="utf-8")
@@ -112,12 +113,13 @@ def test_docs_and_config_consistency():
     architecture = (root / "ARCHITECTURE.md").read_text()
     env_example = (root / ".env.example").read_text()
     assert "host: 127.0.0.1" in config
-    assert "media_max_attachments: 20" in config and "prepared_queue_size: 4" in config
-    assert "rich_messages_enabled: false" in config and "telegram.rich_messages_enabled" in readme
+    assert "media_max_attachments: 20" in config and "prepared_queue_size: 1" in config
+    assert "rich_messages_enabled: true" in config and "telegram.rich_messages_enabled" in readme
     assert "dead_letter_max_bytes: 33554432" in config and "dead_letter_backup_count: 2" in config
     assert "host.docker.internal" in readme and "mode-0600" in readme
     assert "approximately 96 MiB total" in readme and "no age-based deletion" in readme
-    assert "`.pending` file" in readme and "interrupted `.pending` rotation" in readme
+    assert "interrupted temporary write is discarded" in readme
+    assert "original backup count" in readme and "interrupted staged rotation" in readme
     assert "M0-M4 已实现" in architecture and "GET /v1/events?after=" in architecture
     assert "do not double" in env_example and "docker compose up -d" in env_example
 

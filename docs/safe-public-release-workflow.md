@@ -153,7 +153,9 @@ Run this after every history rewrite and before every push to a public remote. A
     'mkdir /tmp/project && cp -a /workspace/. /tmp/project/ && cd /tmp/project && \
      pip install -r requirements-dev.txt && pytest -q && \
      python -m compileall -q src tests scripts'
-  docker compose config
+  docker compose config --no-interpolate --no-env-resolution --quiet
   ```
+
+  Never run plain `docker compose config` in captured output: it can render values loaded from `.env` or service `env_file` entries. Confirm support for both safety flags with `docker compose config --help` before validation.
 
 - Keep the private repository and its backup separate from the public one.

@@ -2,7 +2,7 @@ bridge:
   url: "http://host.docker.internal:17891"
   reconnect_max_backoff_s: 60
 telegram:
-  rich_messages_enabled: false
+  rich_messages_enabled: true
   rate_limit_global_per_s: 25
   rate_limit_per_chat_per_min: 18
   media_max_bytes: 20971520
@@ -20,4 +20,4 @@ health:
   port: 8080
 admin_chat_id: "${ADMIN_CHAT_ID}"
 queue_size: 10000
-prepared_queue_size: 4
+prepared_queue_size: 1
