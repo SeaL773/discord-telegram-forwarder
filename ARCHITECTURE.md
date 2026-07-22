@@ -142,8 +142,8 @@ discord-message-bridge            Telegram Bot API
 - in-flight 目标同时保存 `rich` / `media` / `fallback` phase;重启必须从已持久化 phase 继续,即使运行时 Rich 开关后来关闭,也不能改变已经冻结的发送决策。
 - 实现: 单个 JSON 文件,原子写(write temp + rename),挂载到 Docker volume。消息量不构成用 SQLite 的理由。
 - 目标死信采用稳定 identity 和可恢复幂等终态转换: 若死信 append+fsync 后、状态终态持久化前崩溃,重启会识别已有记录并只补写目标终态,不重发、不重复追加死信;其他目标仍保持独立 pending。该协议不宣称两个文件之间具备原子事务。
-- `state.json` 的 bootstrap/in-flight 部分以及 `failed-events.ndjson` 可包含完整 Discord 事件和 Telegram 目标 ID。bootstrap/in-flight payload 必须保留到对应顺序恢复步骤持久化完成,提前裁剪会破坏冻结决策和有序恢复,因此当前不做最小化。
-- 死信按大小和数量有限轮转:下一条完整记录会使 active 超过 `dead_letter_max_bytes` 时,先将完整记录写入同目录 `.pending` 并 file-fsync,再将 active 原子 replace 为 `.1`、旧 `.1..N-1` 依次后移,最后把 `.pending` 原子提升为 active。启动后的首次 append 会先完成中断的 pending rotation。仅保留 `dead_letter_backup_count` 个 backup。默认 32 MiB × (active + 2 backup),稳态通常总量约 96 MiB;中断轮转期间可临时多一个 pending generation。单条超限记录不会被截断或静默脱敏,故 active 可超过阈值。所有 retained/pending 文件保持 0600,namespace 变更后 fsync 父目录,并拒绝 symlink/非普通文件。
+- `state.json` 的 forwarding/rejected bootstrap、in-flight 部分以及 `failed-events.ndjson` 可包含完整 Discord 事件和 Telegram 目标 ID。bootstrap 中已冻结为 drop 的条目只需持久化 cursor/action,恢复时不再重新路由;其余 bootstrap/in-flight payload 必须保留到对应顺序恢复步骤持久化完成,提前裁剪会破坏冻结决策和有序恢复。
+- 死信按大小和数量有限轮转:下一条完整记录会使 active 超过 `dead_letter_max_bytes` 时,先写入并 file-fsync 同目录临时文件,再原子发布为 `.pending`;启动时丢弃未完成的临时写,绝不把截断记录提升为 active。轮转 plan 持久化事务开始时的 backup count,随后把 active 与 `.1..N` 搬到私有 stage 路径,写入并 fsync ready marker,从旧到新提交 `.N..1`,最后把 `.pending` 原子提升为 active。每次 namespace 变更后立即 fsync 父目录。`StateStore` 启动时以 plan 中的 count 完成中断事务,再按当前配置清理多余 generation,之后才加载恢复状态和扫描 identity。仅保留 `dead_letter_backup_count` 个 backup。默认 32 MiB × (active + 2 backup),稳态通常总量约 96 MiB;中断期间可临时存在 temp/stage/plan/ready/pending 文件。单条超限记录不会被截断或静默脱敏,故 active 可超过阈值。所有相关文件保持 0600,并拒绝 symlink/非普通文件。
 - 恢复首次需要 identity 时以有界 chunk/line parser 一次扫描 active、全部 retained rotation 以及 pending。target record 把稳定 identity 序列化在完整 payload 之前,因此即使记录超过普通 line parser 上限,仍可在有界 prefix 内恢复。这里不做按时间删除:append+fsync 后、state persist 前的崩溃可能仍依赖较旧 rotation 中的 identity;按年龄过期会重新引入重复转发/重复死信风险。
 
 ### 4.7 日志与配置
