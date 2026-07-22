@@ -162,26 +162,30 @@ class MediaHandler:
             if not ip.is_global or ip.is_multicast or ip.is_reserved or ip.is_unspecified or ip.is_loopback or ip.is_private or ip.is_link_local:
                 raise ValueError("media host resolved to non-global address")
 
-    async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
-        attachments = extract_attachments(event)
+    async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+        attachments = extract_attachments(event) if attachments is None else attachments
         allowed = attachments[: self.max_attachments]
         failed = [item.url for item in attachments[self.max_attachments :]]
         media: list[DownloadedMedia] = []
         total = 0
         for attachment in allowed:
             try:
-                item = await self.download(attachment)
-                if total + len(item.data) > self.max_total_bytes:
+                remaining = self.max_total_bytes - total
+                if remaining <= 0:
                     raise ValueError("aggregate media too large")
+                item = await self.download(attachment, remaining)
                 media.append(item)
                 total += len(item.data)
             except (httpx.HTTPError, ValueError, TypeError, OSError):
                 failed.append(attachment.url)
         return media, failed
 
-    async def download(self, attachment: Attachment) -> DownloadedMedia:
+    async def download(self, attachment: Attachment, byte_budget: int | None = None) -> DownloadedMedia:
         await self._safe_url(attachment.url)
-        if attachment.declared_size is not None and attachment.declared_size > self.max_bytes:
+        limit = self.max_bytes if byte_budget is None else min(self.max_bytes, byte_budget)
+        if limit <= 0:
+            raise ValueError("media byte budget exhausted")
+        if attachment.declared_size is not None and attachment.declared_size > limit:
             raise ValueError("declared media too large")
         chunks: list[bytes] = []
         total = 0
@@ -192,13 +196,16 @@ class MediaHandler:
             length = response.headers.get("content-length")
             if length is not None:
                 try:
-                    if int(length) > self.max_bytes:
-                        raise ValueError("header media too large")
+                    content_length = int(length)
                 except (TypeError, ValueError) as exc:
                     raise ValueError("invalid content length") from exc
+                if content_length < 0:
+                    raise ValueError("invalid content length")
+                if content_length > limit:
+                    raise ValueError("header media too large")
             async for chunk in response.aiter_bytes():
                 total += len(chunk)
-                if total > self.max_bytes:
+                if total > limit:
                     raise ValueError("streamed media too large")
                 chunks.append(chunk)
             response_type = response.headers.get("content-type", "").split(";", 1)[0].strip()

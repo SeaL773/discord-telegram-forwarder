@@ -5,8 +5,8 @@ from typing import Any
 import httpx
 pytest = import_module("pytest")
 
-from src.main import persist_gap_and_alert, prepare_work
-from src.models import DownloadedMedia, Envelope, EventPreparationError, RejectedEvent, Target, WorkItem
+from src.main import bootstrap_work_item, persist_gap_and_alert, prepare_work
+from src.models import Attachment, DownloadedMedia, Envelope, EventPreparationError, FormattedMessage, PreparedEvent, RejectedEvent, Target, WorkItem
 from src.state import StateStore
 
 
@@ -49,8 +49,8 @@ async def test_prepare_only_converts_explicit_deterministic_rejection():
             del event
             return []
     class Media:
-        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
-            del event
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event, attachments
             return [], []
     rejected = RejectedEvent("bad", {"schema_version": 2}, "invalid event schema")
     prepared = await prepare_work(WorkItem(rejected), Router(), Media(), None)
@@ -73,14 +73,75 @@ async def test_prepare_only_converts_explicit_deterministic_rejection():
 
 
 @pytest.mark.asyncio
-async def test_prepare_converts_explicit_formatter_rejection_without_swallowing_other_errors(monkeypatch):
+async def test_prepare_drop_skips_formatting_attachment_extraction_and_download(monkeypatch):
     class Router:
         def route(self, event: dict[str, Any]) -> list[Target]:
             del event
             return []
+
     class Media:
-        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event, attachments
+            raise AssertionError("drop event must not download media")
+
+    monkeypatch.setattr("src.main.format_event", lambda _event: (_ for _ in ()).throw(AssertionError("drop event must not be formatted")))
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: (_ for _ in ()).throw(AssertionError("drop event must not extract attachments")))
+
+    envelope = Envelope("drop", {"event_type": "CREATED", "message": {}})
+    prepared = await prepare_work(WorkItem(envelope), Router(), Media(), None)
+
+    assert isinstance(prepared, PreparedEvent)
+    assert prepared.envelope is envelope
+    assert prepared.targets == []
+    assert prepared.formatted == FormattedMessage("", "")
+    assert prepared.media == []
+    assert prepared.fallback_urls == []
+    assert prepared.attachment_urls == []
+
+
+def test_bootstrap_work_item_recovers_cursor_only_drop_and_payload_items():
+    dropped = bootstrap_work_item({"cursor": "drop", "action": "drop"})
+    assert dropped == WorkItem(Envelope("drop", {}), ())
+
+    forwarded_event = {"message": {"content": "keep"}}
+    forwarded = bootstrap_work_item({"cursor": "forward", "event": forwarded_event, "targets": [{"chat_id": "1", "thread_id": 7}]})
+    assert forwarded == WorkItem(Envelope("forward", forwarded_event), (Target("1", 7),))
+
+    rejected_event = {"schema_version": 2}
+    rejected = bootstrap_work_item({"cursor": "reject", "event": rejected_event, "targets": [], "rejection_reason": "invalid schema"})
+    assert rejected == WorkItem(RejectedEvent("reject", rejected_event, "invalid schema"), ())
+
+
+@pytest.mark.asyncio
+async def test_prepare_reuses_extracted_attachments_for_media_download(monkeypatch):
+    attachments = [Attachment("https://cdn.discordapp.com/file", "file")]
+
+    class Router:
+        def route(self, event: dict[str, Any]) -> list[Target]:
             del event
+            return [Target("1")]
+
+    class Media:
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event
+            assert attachments is not None and attachments[0].url == "https://cdn.discordapp.com/file"
+            return [], []
+
+    monkeypatch.setattr("src.main.extract_attachments", lambda _event: attachments)
+    prepared = await prepare_work(WorkItem(Envelope("cursor", {"event_type": "CREATED", "message": {}})), Router(), Media(), None)
+    assert isinstance(prepared, PreparedEvent)
+    assert prepared.attachment_urls == [attachments[0].url]
+
+
+@pytest.mark.asyncio
+async def test_prepare_converts_explicit_formatter_rejection_without_swallowing_other_errors(monkeypatch):
+    class Router:
+        def route(self, event: dict[str, Any]) -> list[Target]:
+            del event
+            return [Target("1")]
+    class Media:
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event, attachments
             return [], []
     envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
     monkeypatch.setattr("src.main.format_event", lambda _event, _media_count=0: (_ for _ in ()).throw(EventPreparationError("bad format")))
@@ -98,10 +159,10 @@ async def test_prepare_extract_exception_classification_and_cancellation(monkeyp
     class Router:
         def route(self, event: dict[str, Any]) -> list[Target]:
             del event
-            return []
+            return [Target("1")]
     class Media:
-        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
-            del event
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event, attachments
             return [], []
     envelope = Envelope("c", {"event_type": "CREATED", "message": {}})
 
@@ -126,8 +187,8 @@ async def test_prepare_does_not_dead_letter_transient_media_failure(monkeypatch)
             del event
             return [Target("1")]
     class Media:
-        async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]:
-            del event
+        async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]:
+            del event, attachments
             request = httpx.Request("GET", "https://cdn.discordapp.com/file")
             raise httpx.ConnectError("network unavailable", request=request)
     monkeypatch.setattr("src.main.extract_attachments", lambda _event: [])

@@ -14,7 +14,7 @@ from .config import load_config
 from .formatter import format_event
 from .health import HealthMonitor
 from .media import MediaHandler, extract_attachments
-from .models import DownloadedMedia, Envelope, EventPreparationError, PreparedEvent, RejectedEvent, Target, WorkItem
+from .models import Attachment, DownloadedMedia, Envelope, EventPreparationError, FormattedMessage, PreparedEvent, RejectedEvent, Target, WorkItem
 from .router import Router
 from .state import StateStore
 from .tg_sender import TgSender
@@ -61,7 +61,7 @@ class EventRouter(Protocol):
 
 
 class EventMedia(Protocol):
-    async def download_all(self, event: dict[str, Any]) -> tuple[list[DownloadedMedia], list[str]]: ...
+    async def download_all(self, event: dict[str, Any], attachments: list[Attachment] | None = None) -> tuple[list[DownloadedMedia], list[str]]: ...
 
 
 class AlertSender(Protocol):
@@ -88,6 +88,17 @@ def frozen_targets(raw: list[dict[str, Any]]) -> tuple[Target, ...]:
     return tuple(Target(str(item["chat_id"]), item.get("thread_id")) for item in raw)
 
 
+def bootstrap_work_item(item: dict[str, Any]) -> WorkItem:
+    cursor = item["cursor"]
+    if item.get("action") == "drop":
+        return WorkItem(Envelope(cursor, {}), ())
+    event = item["event"]
+    targets = frozen_targets(item["targets"])
+    reason = item.get("rejection_reason")
+    envelope = RejectedEvent(cursor, event, reason) if isinstance(reason, str) else Envelope(cursor, event)
+    return WorkItem(envelope, targets)
+
+
 def pending_targets_are_fallback_only(inflight: dict[str, Any] | None, cursor: str) -> bool:
     if inflight is None or inflight.get("cursor") != cursor:
         return False
@@ -101,13 +112,15 @@ async def prepare_work(work: WorkItem, router: EventRouter, media: EventMedia, i
         return envelope
     try:
         targets = list(work.frozen_targets) if work.frozen_targets is not None else router.route(envelope.event)
+        if not targets:
+            return PreparedEvent(envelope, targets, FormattedMessage("", ""))
         attachments = extract_attachments(envelope.event)
         formatted = format_event(envelope.event, len(attachments))
     except EventPreparationError as exc:
         return RejectedEvent(envelope.cursor, envelope.event, str(exc))
     all_urls = [item.url for item in attachments]
     fallback_only = pending_targets_are_fallback_only(inflight, envelope.cursor)
-    downloaded, failed = ([], all_urls) if fallback_only or not targets else await media.download_all(envelope.event)
+    downloaded, failed = ([], all_urls) if fallback_only else await media.download_all(envelope.event, attachments)
     return PreparedEvent(envelope, targets, formatted, downloaded, failed, all_urls)
 
 
@@ -163,8 +176,7 @@ async def run() -> None:
             bootstrap = state.bootstrap
             if bootstrap is not None:
                 for item in bootstrap["items"][bootstrap["next_index"] :]:
-                    envelope = RejectedEvent(item["cursor"], item["event"], item["rejection_reason"]) if isinstance(item.get("rejection_reason"), str) else Envelope(item["cursor"], item["event"])
-                    await enqueue(WorkItem(envelope, frozen_targets(item["targets"])))
+                    await enqueue(bootstrap_work_item(item))
 
         async def gap(ready: str | None) -> None:
             await persist_gap_and_alert(state, sender, config.admin_chat_id, ready)
@@ -181,8 +193,7 @@ async def run() -> None:
                         if ready is not None:
                             await state.save_bootstrap(ready, plan)
                             for item in plan:
-                                envelope = RejectedEvent(item["cursor"], item["event"], item["rejection_reason"]) if isinstance(item.get("rejection_reason"), str) else Envelope(item["cursor"], item["event"])
-                                await enqueue(WorkItem(envelope, frozen_targets(item["targets"])))
+                                await enqueue(bootstrap_work_item(item))
                             continue
                     async for envelope in bridge.session(state.ack, router.snapshot, gap, backoff.ready):
                         health.event_received()
