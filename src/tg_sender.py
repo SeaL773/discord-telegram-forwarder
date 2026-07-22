@@ -113,7 +113,8 @@ class TgSender:
             if index < len(records) and records[index].get("status") != "pending":
                 continue
             await self._send_target(index, envelope, target, normal_formatted, fallback_formatted, media, fallback_urls)
-        await self.state.finish(envelope.cursor, "forwarded")
+        if self.state.in_flight is not None:
+            await self.state.finish(envelope.cursor, "forwarded")
 
     async def send_alert(self, chat_id: str, text: str) -> bool:
         target = Target(chat_id)
@@ -207,9 +208,9 @@ class TgSender:
                     await self.state.set_fallback(index)
                     await self._send_fallback(index, envelope, target, fallback_formatted)
                 else:
-                    await self.state.dead_letter_target(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason})
+                    await self.state.dead_letter_target_and_finish(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "reason": result.reason}, envelope.cursor)
                 return
-        await self.state.terminal(index, "sent")
+        await self.state.complete_target(index, "sent", envelope.cursor)
 
     def _rich_eligible(self, formatted: FormattedMessage, media: list[DownloadedMedia]) -> bool:
         return (
@@ -230,7 +231,7 @@ class TgSender:
         while True:
             result = await self._attempt(batch, target)
             if result.ok:
-                await self.state.terminal(index, "sent")
+                await self.state.complete_target(index, "sent", envelope.cursor)
                 return
             if result.retry_after is not None:
                 await self.sleep(result.retry_after)
@@ -240,7 +241,7 @@ class TgSender:
                 await self._send_target(index, envelope, target, formatted, fallback_formatted, media, fallback_urls)
                 return
             if result.code in {401, 403}:
-                await self.state.dead_letter_target(index, self._target_dead_letter(envelope, target, "rich", result.reason))
+                await self.state.dead_letter_target_and_finish(index, self._target_dead_letter(envelope, target, "rich", result.reason), envelope.cursor)
                 return
             if result.retryable:
                 failures += 1
@@ -248,7 +249,7 @@ class TgSender:
                 if failures < 3:
                     await self.sleep(2 ** (failures - 1))
                     continue
-            await self.state.dead_letter_target(index, self._target_dead_letter(envelope, target, "rich", result.reason))
+            await self.state.dead_letter_target_and_finish(index, self._target_dead_letter(envelope, target, "rich", result.reason), envelope.cursor)
             return
 
     @staticmethod
@@ -268,7 +269,7 @@ class TgSender:
         while True:
             result = await self._attempt(batch, target)
             if result.ok:
-                await self.state.terminal(index, "sent")
+                await self.state.complete_target(index, "sent", envelope.cursor)
                 return
             if result.retry_after is not None:
                 await self.sleep(result.retry_after)
@@ -279,7 +280,7 @@ class TgSender:
                 if failures < 3:
                     await self.sleep(2 ** (failures - 1))
                     continue
-            await self.state.dead_letter_target(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "phase": "fallback", "reason": result.reason})
+            await self.state.dead_letter_target_and_finish(index, {"cursor": envelope.cursor, "event": envelope.event, "target": {"chat_id": target.chat_id, "thread_id": target.thread_id}, "phase": "fallback", "reason": result.reason}, envelope.cursor)
             return
 
     def _common(self, target: Target) -> dict[str, Any]:
@@ -336,8 +337,6 @@ class TgSender:
         files: dict[str, tuple[str, bytes, str]] = {}
         references: list[str] = []
         for index, item in enumerate(media):
-            if item.kind not in {"photo", "video"}:
-                raise ValueError("rich message supports only photo and video media")
             media_id = f"m{index}"
             file_id = f"file{index}"
             media_entries.append({"id": media_id, "media": {"type": item.kind, "media": f"attach://{file_id}"}})

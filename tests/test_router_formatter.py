@@ -461,6 +461,7 @@ def test_embed_dict_shape_caps_embeds_fields_and_keeps_caption_utf16_safe():
 def test_independent_event_notifications_do_not_add_emoji(event_type):
     text = format_event(event(event_type=event_type)).text
     assert text.startswith("<b>&lt;alice&gt;</b> in <b>#chan</b>")
+    assert not text.startswith(("🆕", "✏️", "🗑️", "👻", "ℹ️"))
 
 
 def test_logger_monitor_icons_exact():
