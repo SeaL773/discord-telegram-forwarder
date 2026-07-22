@@ -111,18 +111,10 @@ discord-message-bridge            Telegram Bot API
 
 ### 4.3 Formatter — 消息格式化
 
-职责: event → Telegram 消息文本(HTML parse mode)。
+职责: event → Telegram classic HTML fallback + Bot API Rich Message HTML。
 
-模板要素:
-```
-🆕 #channel-name @ ServerName          ← 事件类型图标 + 来源
-👤 AuthorName
-━━━━━━━━━━
-消息正文 (HTML-escaped)
-[附件: image.png]                       ← 媒体降级时的链接形式
-```
-
-- 事件图标: 🆕 CREATED / ✏️ EDITED / 🗑️ DELETED / 👻 GHOST_PINGED
+- 开启 `telegram.rich_messages_enabled` 后,所有事件都生成 Rich HTML:频道 hashtag 使用 `<h3>`,正文和 embed 使用结构化段落/引用/代码块,作者、服务器和事件类型放入 footer。关闭开关时使用 classic HTML。
+- Rich 与 classic 路径都保留无图标的克制样式;EDITED / DELETED / GHOST_PINGED 通过文字标签表达。
 - EDITED 尽量展示 before → after(collector 的 NDJSON 里若含旧内容);DELETED 展示被删内容 —— 这正是用 MessageLogger 的价值。
 - 正文超长时按 Telegram 的 UTF-16 code-unit 口径执行 caption 1024 / text 4096 截断,并保持 HTML 标签闭合;媒体降级时先为完整 fallback 条目预留空间。只有具备 host、无空白/控制字符的合法 HTTP(S) URL 可进入 `href`,其他值固定降级为转义后的纯文本 `Attachment unavailable`,不会污染同一消息中的正常正文或合法链接。
 - 所有用户内容先 HTML-escape,再将 Discord 的 `#`-`######` 标题与 `***粗斜体***` / `**粗体**` / `*斜体*` 安全转换为 Telegram HTML;未支持的 Markdown 保持原文。
@@ -131,7 +123,7 @@ discord-message-bridge            Telegram Bot API
 ### 4.4 MediaHandler — 媒体转发
 
 - 按 `attachments → embed image → embed images[] → thumbnail` 的稳定顺序提取媒体(跳过 video),按 URL 去重并下载。仅允许 HTTPS:443 的精确主机 `cdn.discordapp.com`、`media.discordapp.net`、`images-ext-1.discordapp.net`、`images-ext-2.discordapp.net`、`pbs.twimg.com`;仍执行公共 DNS、无重定向、超时和大小检查。
-- 按 MIME 分发: 图片 → `sendPhoto`,视频 → `sendVideo`,其他 → `sendDocument`;多附件用 `sendMediaGroup`。
+- Rich 路径把已下载的图片/视频直接 multipart 上传到 `sendRichMessage`;无媒体也使用 Rich。文档等不支持的媒体走 classic `sendDocument`,classic 多附件使用 `sendMediaGroup`。
 - **任何失败(下载超时 / 403 / 超限)降级为文本消息 + URL 链接**,绝不因媒体失败丢掉整条转发。
 - 注意: Discord CDN 链接带过期签名(`ex`/`is`/`hm` 参数),所以下载要在收到事件后**立即**做,不能积压后再下。
 
@@ -141,11 +133,13 @@ discord-message-bridge            Telegram Bot API
 - 令牌桶限流: 全局 ~30 msg/s,**单 chat ~20 msg/min**(TG 对群组的硬限制,这是最容易踩的坑);突发容量与持续 refill rate 分离,允许单个最多 10 项的媒体组,不抬高配置的持续速率。
 - 429 处理: 读取 `retry_after` 精确等待后重试。
 - 网络错误: 重试 3 次(指数退避),仍失败则记 `failed-events.ndjson` 死信文件 + 日志告警,然后**继续推进 cursor**(不让一条毒消息卡死整个流水线)。
+- 每个目标持久化 `rich → media → fallback` phase。Rich 的 400/404/413 在发送 classic 前持久切换到 media;401/403 直接死信;网络、超时、5xx 和 malformed success 只重试 Rich,避免不确定成功后跨格式重复发送。文档媒体从 media phase 开始。
 - 启动 Topic 同步只使用可逆的 `closeForumTopic` / `reopenForumTopic`,排除 General Topic,绝不删除历史。health endpoint 先启动;同步总预算 60 秒,单次 `retry_after` 最多 60 秒,预算耗尽后记录元数据告警并继续启动消息流水线。
 
 ### 4.6 StateStore
 
 - 内容包含: `last_acked_cursor`、恢复计划、少量运行统计和当前规则所管理 Topic 的成功 `topic_states`。启动同步会原子裁剪规则中已不存在的 Topic key,但不修改 cursor、bootstrap 或 in-flight 恢复数据。Telegram 没有可用的 Topic 状态查询,因此该字段记录本程序上一次成功操作/首次升级基线,不是服务端绝对真相。
+- in-flight 目标同时保存 `rich` / `media` / `fallback` phase;重启必须从已持久化 phase 继续,即使运行时 Rich 开关后来关闭,也不能改变已经冻结的发送决策。
 - 实现: 单个 JSON 文件,原子写(write temp + rename),挂载到 Docker volume。消息量不构成用 SQLite 的理由。
 - 目标死信采用稳定 identity 和可恢复幂等终态转换: 若死信 append+fsync 后、状态终态持久化前崩溃,重启会识别已有记录并只补写目标终态,不重发、不重复追加死信;其他目标仍保持独立 pending。该协议不宣称两个文件之间具备原子事务。
 - `state.json` 的 bootstrap/in-flight 部分以及 `failed-events.ndjson` 可包含完整 Discord 事件和 Telegram 目标 ID。bootstrap/in-flight payload 必须保留到对应顺序恢复步骤持久化完成,提前裁剪会破坏冻结决策和有序恢复,因此当前不做最小化。
@@ -288,7 +282,7 @@ discord-tg-forwarder/
 └── data/                     # volume: state.json / failed-events.ndjson
 ```
 
-依赖(刻意精简): `httpx`(REST + TG API + CDN 下载)、`websockets`(Bridge WS)、`PyYAML`、`loguru`。**不引入** python-telegram-bot 之类的重框架 —— 只用到 sendMessage/sendPhoto/sendDocument 几个端点,httpx 直调足矣。
+依赖(刻意精简): `httpx`(REST + TG API + CDN 下载)、`websockets`(Bridge WS)、`PyYAML`、`loguru`。**不引入** python-telegram-bot 之类的重框架 —— `sendRichMessage`、classic media/message 和 Topic 端点均由 httpx 直调。
 
 ---
 
