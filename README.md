@@ -17,7 +17,7 @@ Docker Compose 2.24.0 or newer is required because `docker-compose.yml` uses the
 
 Bridge auth is sent only as an Authorization header. REST uses `after` and `limit=500`. No event body, attachment URL, token, Telegram response body, or auth header is logged.
 
-Discord message and embed-description Markdown headings (`#` through `######`), bold, italic, and bold-italic emphasis are converted to Telegram HTML. User text is HTML-escaped before these supported markers are transformed; unsupported Markdown remains literal. `telegram.rich_messages_enabled` is a strict boolean and defaults to `false`. When enabled, short messages retain compact classic HTML, while replies, embeds, fenced code, multiple extracted media items, long content, and meaningful edits use Telegram Bot API 10.2 Rich Messages when all downloaded media is photo or video. Rich media is uploaded directly in one multipart request; source attachment URLs are not delegated to Telegram for fetching.
+Discord message and embed-description Markdown headings (`#` through `######`), bold, italic, and bold-italic emphasis are converted to Telegram HTML. User text is HTML-escaped before these supported markers are transformed; unsupported Markdown remains literal. `telegram.rich_messages_enabled` is a strict boolean and defaults to `false`. When enabled, every message uses Telegram Bot API 10.2 Rich Messages when its downloaded media is empty or entirely photo/video; unsupported document media and definite Rich API rejections retain the classic fallback path. Rich media is uploaded directly in one multipart request; source attachment URLs are not delegated to Telegram for fetching.
 
 ## Rules
 
