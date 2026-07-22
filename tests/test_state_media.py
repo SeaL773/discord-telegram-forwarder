@@ -32,19 +32,89 @@ async def test_state_atomic_fanout_restart_and_dead_letter_order(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_rich_retry_counter_and_phase_survive_restart(tmp_path: Path):
+async def test_retry_counters_survive_restart(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
-    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")], "rich")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")])
+
+    await state.retry(0)
     await state.retry(0, rich=True)
+    await state.retry(0, fallback=True)
+    assert state.in_flight is not None and state.in_flight["targets"][0]["retries"] == 1
+    assert state.in_flight["targets"][0]["rich_retries"] == 1
+    assert state.in_flight["targets"][0]["fallback_retries"] == 1
 
     restarted = StateStore(state.path, state.dead_letter_path)
     assert restarted.in_flight is not None
-    assert restarted.in_flight["targets"][0]["phase"] == "rich"
+    assert restarted.in_flight["targets"][0]["retries"] == 1
     assert restarted.in_flight["targets"][0]["rich_retries"] == 1
+    assert restarted.in_flight["targets"][0]["fallback_retries"] == 1
 
 
 @pytest.mark.asyncio
-async def test_set_media_persist_failure_rolls_back_rich_phase(tmp_path: Path, monkeypatch):
+async def test_retry_persist_failure_rolls_back_attempt(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")])
+
+    async def fail_persist():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError, match="disk full"):
+        await state.retry(0)
+
+    assert state.in_flight is not None and state.in_flight["targets"][0]["retries"] == 0
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["retries"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_kind", ["in_flight", "bootstrap"])
+async def test_gap_persist_failure_rolls_back_recovery_state(tmp_path: Path, monkeypatch, recovery_kind: str):
+    state = StateStore(tmp_path / f"{recovery_kind}-state.json", tmp_path / f"{recovery_kind}-dead.ndjson")
+    if recovery_kind == "in_flight":
+        await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")])
+    else:
+        await state.save_bootstrap("cursor", [{"cursor": "cursor", "action": "drop"}])
+
+    async def fail_persist():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError, match="disk full"):
+        await state.gap_to("ready")
+
+    assert state.ack is None
+    assert state.data["stats"]["gaps"] == 0
+    assert (state.in_flight is not None) is (recovery_kind == "in_flight")
+    assert (state.bootstrap is not None) is (recovery_kind == "bootstrap")
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.ack is None
+    assert restarted.data["stats"]["gaps"] == 0
+    assert (restarted.in_flight is not None) is (recovery_kind == "in_flight")
+    assert (restarted.bootstrap is not None) is (recovery_kind == "bootstrap")
+
+
+@pytest.mark.asyncio
+async def test_persist_has_no_fallible_permission_step_after_atomic_replace(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")])
+    original_chmod = os.chmod
+
+    def reject_state_path(path, mode):
+        if Path(path) == state.path:
+            raise OSError("post-replace chmod must not run")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(os, "chmod", reject_state_path)
+    await state.set_fallback(0)
+    monkeypatch.setattr(os, "chmod", original_chmod)
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["phase"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_set_media_persist_failure_rolls_back_rich_phase_in_memory_and_disk(tmp_path: Path, monkeypatch):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
     await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")], "rich")
 
@@ -54,7 +124,86 @@ async def test_set_media_persist_failure_rolls_back_rich_phase(tmp_path: Path, m
     monkeypatch.setattr(state, "_persist", fail_persist)
     with pytest.raises(OSError, match="disk full"):
         await state.set_media(0)
+
     assert state.in_flight is not None and state.in_flight["targets"][0]["phase"] == "rich"
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["phase"] == "rich"
+
+
+@pytest.mark.asyncio
+async def test_terminal_persists_early_targets_and_combines_last_target_with_finish(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1"), Target("2")])
+
+    await state.complete_target(0, "sent", "cursor")
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.ack is None
+    assert restarted.in_flight is not None
+    assert [target["status"] for target in restarted.in_flight["targets"]] == ["sent", "pending"]
+
+    persist_calls = 0
+    original_persist = restarted._persist
+
+    async def counted_persist():
+        nonlocal persist_calls
+        persist_calls += 1
+        await original_persist()
+
+    monkeypatch.setattr(restarted, "_persist", counted_persist)
+    await restarted.complete_target(1, "sent", "cursor")
+
+    assert persist_calls == 1
+    assert restarted.ack == "cursor"
+    assert restarted.in_flight is None
+    assert restarted.data["stats"]["forwarded"] == 1
+    persisted = StateStore(restarted.path, restarted.dead_letter_path)
+    assert persisted.ack == "cursor" and persisted.in_flight is None
+
+
+@pytest.mark.asyncio
+async def test_complete_target_persist_failure_rolls_back_cursor_bootstrap_and_target(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    event = {"message": {"content": "payload"}}
+    item = {"cursor": "cursor", "event": event, "targets": [{"chat_id": "1", "thread_id": None}]}
+    await state.save_bootstrap("cursor", [item])
+    await state.begin(Envelope("cursor", event), [Target("1")])
+
+    async def fail_persist():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(state, "_persist", fail_persist)
+    with pytest.raises(OSError, match="disk full"):
+        await state.complete_target(0, "sent", "cursor")
+
+    assert state.ack is None
+    assert state.bootstrap is not None and state.bootstrap["next_index"] == 0
+    assert state.in_flight is not None and state.in_flight["targets"][0]["status"] == "pending"
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.ack is None
+    assert restarted.bootstrap is not None and restarted.bootstrap["next_index"] == 0
+    assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_last_dead_letter_target_combines_terminal_and_finish_persist(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"message": {"content": "payload"}}), [Target("1")])
+    persist_calls = 0
+    original_persist = state._persist
+
+    async def counted_persist():
+        nonlocal persist_calls
+        persist_calls += 1
+        await original_persist()
+
+    monkeypatch.setattr(state, "_persist", counted_persist)
+    await state.dead_letter_target_and_finish(0, target_dead_letter_record(), "cursor")
+
+    assert persist_calls == 1
+    assert state.ack == "cursor" and state.in_flight is None
+    assert state.data["stats"]["dead_lettered"] == 1
+    assert state.data["stats"]["forwarded"] == 1
+    assert state.dead_letter_path.read_text().count("\n") == 1
 
 
 def target_dead_letter_record(cursor="cursor", chat_id="1"):
@@ -198,6 +347,172 @@ async def test_recovery_survives_interrupted_rotation_shift(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("crash_phase", ["after_active_stage", "after_active_backup", "after_pending_promote"])
+async def test_rotation_restart_is_idempotent_after_each_commit_phase(tmp_path: Path, monkeypatch, crash_phase: str):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.1").write_text(json.dumps({"sequence": "backup-1"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.2").write_text(json.dumps({"sequence": "backup-2"}) + "\n", encoding="ascii")
+    original_replace = os.replace
+    stage_zero = state._dead_letter_rotation_stage_path(0)
+    pending = state._pending_dead_letter_path()
+
+    def crash_after_selected_replace(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        should_crash = (
+            (crash_phase == "after_active_stage" and source_path == state.dead_letter_path and destination_path == stage_zero)
+            or (crash_phase == "after_active_backup" and source_path == stage_zero and destination_path == Path(f"{state.dead_letter_path}.1"))
+            or (crash_phase == "after_pending_promote" and source_path == pending and destination_path == state.dead_letter_path)
+        )
+        original_replace(source, destination)
+        if should_crash:
+            raise OSError(f"crash {crash_phase}")
+
+    monkeypatch.setattr(os, "replace", crash_after_selected_replace)
+    with pytest.raises(OSError, match=crash_phase):
+        await state.dead_letter({"sequence": "new", "payload": "x" * 150})
+    monkeypatch.setattr(os, "replace", original_replace)
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    restarted_again = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    assert json.loads(restarted_again.dead_letter_path.read_text())["sequence"] == "new"
+    assert json.loads(Path(f"{restarted.dead_letter_path}.1").read_text())["sequence"] == "active"
+    assert json.loads(Path(f"{restarted.dead_letter_path}.2").read_text())["sequence"] == "backup-1"
+    assert not restarted._pending_dead_letter_path().exists()
+    assert not restarted._dead_letter_rotation_marker_path().exists()
+    assert not restarted._dead_letter_rotation_ready_path().exists()
+    assert all(not restarted._dead_letter_rotation_stage_path(index).exists() for index in range(3))
+
+
+@pytest.mark.asyncio
+async def test_rotation_fsyncs_parent_after_each_namespace_change(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.1").write_text(json.dumps({"sequence": "backup-1"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.2").write_text(json.dumps({"sequence": "backup-2"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.3").write_text(json.dumps({"sequence": "excess"}) + "\n", encoding="ascii")
+    operations: list[str] = []
+    original_replace = os.replace
+    original_unlink = Path.unlink
+    original_fsync_parent = state._fsync_parent
+
+    def tracked_replace(source, destination):
+        original_replace(source, destination)
+        operations.append("replace")
+
+    def tracked_unlink(path, *args, **kwargs):
+        original_unlink(path, *args, **kwargs)
+        operations.append("unlink")
+
+    def tracked_fsync_parent(path):
+        original_fsync_parent(path)
+        operations.append("fsync")
+
+    monkeypatch.setattr(os, "replace", tracked_replace)
+    monkeypatch.setattr(Path, "unlink", tracked_unlink)
+    monkeypatch.setattr(state, "_fsync_parent", tracked_fsync_parent)
+    await state.dead_letter({"sequence": "new", "payload": "x" * 150})
+
+    for index, operation in enumerate(operations):
+        if operation in {"replace", "unlink"}:
+            assert index + 1 < len(operations)
+            assert operations[index + 1] == "fsync"
+    assert not Path(f"{state.dead_letter_path}.3").exists()
+
+
+@pytest.mark.asyncio
+async def test_partial_pending_write_is_discarded_without_rotating(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    temporary = state._pending_dead_letter_temp_path()
+    temporary.write_bytes(b'{"sequence":"partial"')
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+
+    assert json.loads(restarted.dead_letter_path.read_text())["sequence"] == "active"
+    assert not temporary.exists()
+    assert not restarted._pending_dead_letter_path().exists()
+    assert not restarted._dead_letter_rotation_marker_path().exists()
+    assert not restarted._dead_letter_rotation_ready_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_rotation_uses_persisted_backup_count_then_applies_reduced_retention(tmp_path: Path, monkeypatch):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.1").write_text(json.dumps({"sequence": "backup-1"}) + "\n", encoding="ascii")
+    Path(f"{state.dead_letter_path}.2").write_text(json.dumps({"sequence": "backup-2"}) + "\n", encoding="ascii")
+    original_create = state._create_dead_letter_rotation_control
+
+    def crash_after_ready(path: Path, payload: bytes):
+        original_create(path, payload)
+        if path == state._dead_letter_rotation_ready_path():
+            raise OSError("crash after ready marker")
+
+    monkeypatch.setattr(state, "_create_dead_letter_rotation_control", crash_after_ready)
+    with pytest.raises(OSError, match="crash after ready marker"):
+        await state.dead_letter({"sequence": "new", "payload": "x" * 150})
+
+    restarted = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=1)
+    restarted_again = StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=1)
+    assert json.loads(restarted_again.dead_letter_path.read_text())["sequence"] == "new"
+    assert json.loads(Path(f"{restarted.dead_letter_path}.1").read_text())["sequence"] == "active"
+    assert not Path(f"{restarted.dead_letter_path}.2").exists()
+    assert not restarted._pending_dead_letter_path().exists()
+    assert not restarted._dead_letter_rotation_marker_path().exists()
+    assert not restarted._dead_letter_rotation_ready_path().exists()
+    assert not restarted._existing_dead_letter_rotation_stages()
+
+
+@pytest.mark.asyncio
+async def test_rotation_fails_closed_when_active_generation_is_missing_before_staging(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    state._write_pending_dead_letter((json.dumps({"sequence": "new"}) + "\n").encode("ascii"))
+    state._create_dead_letter_rotation_control(state._dead_letter_rotation_marker_path(), b"2\n")
+    state.dead_letter_path.unlink()
+
+    with pytest.raises(RuntimeError, match="lost the active generation"):
+        StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+
+    assert state._pending_dead_letter_path().exists()
+    assert state._dead_letter_rotation_marker_path().exists()
+    assert not state._dead_letter_rotation_ready_path().exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ["missing", "duplicate"])
+async def test_rotation_fails_closed_on_ambiguous_active_promotion_state(tmp_path: Path, monkeypatch, corruption: str):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
+    state.dead_letter_path.write_text(json.dumps({"sequence": "active"}) + "\n", encoding="ascii")
+    original_create = state._create_dead_letter_rotation_control
+
+    def crash_after_ready(path: Path, payload: bytes):
+        original_create(path, payload)
+        if path == state._dead_letter_rotation_ready_path():
+            raise OSError("crash after ready marker")
+
+    monkeypatch.setattr(state, "_create_dead_letter_rotation_control", crash_after_ready)
+    with pytest.raises(OSError, match="crash after ready marker"):
+        await state.dead_letter({"sequence": "new", "payload": "x" * 150})
+
+    stage_zero = state._dead_letter_rotation_stage_path(0)
+    backup_one = Path(f"{state.dead_letter_path}.1")
+    if corruption == "missing":
+        stage_zero.unlink()
+    else:
+        backup_one.write_text(json.dumps({"sequence": "ambiguous"}) + "\n", encoding="ascii")
+
+    with pytest.raises(RuntimeError, match="ambiguous commit state"):
+        StateStore(state.path, state.dead_letter_path, dead_letter_max_bytes=100, dead_letter_backup_count=2)
+
+    assert state._pending_dead_letter_path().exists()
+    assert state._dead_letter_rotation_marker_path().exists()
+    assert state._dead_letter_rotation_ready_path().exists()
+
+
+@pytest.mark.asyncio
 async def test_oversized_target_record_keeps_recoverable_identity_prefix(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("src.state.DLQ_MAX_RECOVERY_RECORD_BYTES", 64)
     state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson", dead_letter_max_bytes=100, dead_letter_backup_count=2)
@@ -213,6 +528,42 @@ async def test_oversized_target_record_keeps_recoverable_identity_prefix(tmp_pat
 
     assert restarted.in_flight is not None and restarted.in_flight["targets"][0]["status"] == "dead_lettered"
     assert restarted.dead_letter_path.read_bytes().startswith(b'{"dead_letter_id":"target:cursor:0:1:",')
+
+
+@pytest.mark.asyncio
+async def test_oversized_recovery_rejects_nested_identity_injection(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("src.state.DLQ_MAX_RECOVERY_RECORD_BYTES", 64)
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target("1")])
+    identity = state._target_dead_letter_id(0)
+    state.dead_letter_path.write_text(
+        json.dumps({"event": {"dead_letter_id": identity, "payload": "x" * 256}}, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.recover_target_dead_letters()
+
+    assert restarted.in_flight is not None
+    assert restarted.in_flight["targets"][0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_oversized_identity_prefix_handles_escaped_target_values(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("src.state.DLQ_MAX_RECOVERY_RECORD_BYTES", 64)
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead.ndjson")
+    await state.begin(Envelope("cursor", {"x": 1}), [Target('chat:"\\:\x01')])
+    original_persist = state._persist
+    monkeypatch.setattr(state, "_persist", lambda: (_ for _ in ()).throw(OSError("terminal persist failed")))
+    with pytest.raises(OSError, match="terminal persist failed"):
+        await state.dead_letter_target(0, {**target_dead_letter_record(), "event": {"payload": "x" * 256}})
+    monkeypatch.setattr(state, "_persist", original_persist)
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.recover_target_dead_letters()
+
+    assert restarted.in_flight is not None
+    assert restarted.in_flight["targets"][0]["status"] == "dead_lettered"
 
 
 @pytest.mark.asyncio
@@ -444,6 +795,57 @@ async def test_media_attachment_and_aggregate_limits_keep_small_multibatch():
     assert len(media) == 10 and len(failed) == 12
 
 
+@pytest.mark.asyncio
+async def test_media_remaining_budget_rejects_declared_size_before_request():
+    calls = []
+
+    async def resolver(_host): return ["8.8.8.8"]
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, content=b"123456")
+
+    first = "https://cdn.discordapp.com/first"
+    over_budget = "https://cdn.discordapp.com/over-budget"
+    event = {"message": {"attachments": [
+        {"url": first, "size": 6},
+        {"url": over_budget, "size": 5},
+    ]}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        media, failed = await MediaHandler(client, 10, 15, max_total_bytes=10, resolver=resolver).download_all(event)
+
+    assert [item.attachment.url for item in media] == [first]
+    assert failed == [over_budget]
+    assert calls == [first]
+
+
+@pytest.mark.asyncio
+async def test_media_remaining_budget_rejects_content_length_before_body_iteration():
+    streamed = []
+
+    class CountingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            streamed.append(True)
+            yield b"12345"
+
+    async def resolver(_host): return ["8.8.8.8"]
+
+    def handler(request):
+        if request.url.path == "/first":
+            return httpx.Response(200, content=b"123456")
+        return httpx.Response(200, headers={"content-length": "5"}, stream=CountingStream())
+
+    first = "https://cdn.discordapp.com/first"
+    over_budget = "https://cdn.discordapp.com/over-budget"
+    event = {"message": {"attachments": [{"url": first}, {"url": over_budget}]}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        media, failed = await MediaHandler(client, 10, 15, max_total_bytes=10, resolver=resolver).download_all(event)
+
+    assert [item.attachment.url for item in media] == [first]
+    assert failed == [over_budget]
+    assert streamed == []
+
+
 def test_embed_media_preserves_attachments_deduplicates_and_prefers_safe_proxy():
     attachment = "https://cdn.discordapp.com/attachments/a/original.png"
     proxy = "https://images-ext-1.discordapp.net/external/hash/image.jpg"
@@ -632,7 +1034,7 @@ def test_config_defaults_health_to_loopback(tmp_path: Path, monkeypatch):
 async def test_bootstrap_plan_crash_restart_preserves_order_targets_and_index(tmp_path: Path):
     state = StateStore(tmp_path / "state.json", tmp_path / "dead")
     items = [
-        {"cursor": "a", "event": {"body": "one"}, "targets": []},
+        {"cursor": "a", "action": "drop"},
         {"cursor": "b", "event": {"body": "two"}, "targets": [{"chat_id": "1", "thread_id": 7}]},
     ]
     await state.save_bootstrap("b", items)
@@ -647,9 +1049,24 @@ async def test_bootstrap_plan_crash_restart_preserves_order_targets_and_index(tm
     assert restarted.ack == "a" and bootstrap["next_index"] == 1
     assert bootstrap["items"][1] == items[1]
     await restarted.begin(Envelope("b", items[1]["event"]), [Target("1", 7)])
+    assert restarted.in_flight is not None and restarted.in_flight["event"] == items[1]["event"]
     await restarted.terminal(0, "sent")
     await restarted.finish("b", "forwarded")
     assert restarted.bootstrap is None and restarted.ack == "b"
+
+
+@pytest.mark.asyncio
+async def test_legacy_bootstrap_drop_payload_remains_recoverable(tmp_path: Path):
+    state = StateStore(tmp_path / "state.json", tmp_path / "dead")
+    legacy_drop = {"cursor": "drop", "event": {"message": {"content": "legacy"}}, "targets": []}
+    forwarded = {"cursor": "forward", "event": {"message": {"content": "keep"}}, "targets": [{"chat_id": "1", "thread_id": None}]}
+    await state.save_bootstrap("forward", [legacy_drop, forwarded])
+
+    restarted = StateStore(state.path, state.dead_letter_path)
+    assert restarted.bootstrap is not None and restarted.bootstrap["items"][0] == legacy_drop
+    await restarted.finish("drop", "dropped")
+    assert restarted.bootstrap is not None and restarted.bootstrap["next_index"] == 1
+    assert restarted.bootstrap["items"][1] == forwarded
 
 
 @pytest.mark.asyncio
@@ -660,19 +1077,20 @@ async def test_reject_event_deadletters_before_atomic_ack_and_advances_bootstrap
     await state.reject_event("bad", item["event"], "invalid event schema")
     assert state.ack == "bad" and state.bootstrap is None
     record = json.loads(state.dead_letter_path.read_text().strip())
-    assert record == {"cursor": "bad", "event": item["event"], "reason": "invalid event schema", "phase": "prepare"}
+    assert record == {"dead_letter_id": "prepare:bad", "cursor": "bad", "event": item["event"], "reason": "invalid event schema", "phase": "prepare"}
 
     state = StateStore(tmp_path / "other-state.json", tmp_path / "other-dead.ndjson")
-    original = state._persist
     async def fail_persist(): raise OSError("disk full")
     monkeypatch.setattr(state, "_persist", fail_persist)
     with pytest.raises(OSError):
         await state.reject_event("retry", {"x": 1}, "bad")
     assert state.ack is None
     assert state.dead_letter_path.read_text().count("\n") == 1
-    monkeypatch.setattr(state, "_persist", original)
-    await state.reject_event("retry", {"x": 1}, "bad")
-    assert state.ack == "retry" and state.dead_letter_path.read_text().count("\n") == 2
+    restarted = StateStore(state.path, state.dead_letter_path)
+    await restarted.reject_event("retry", {"x": 1}, "bad")
+    assert restarted.ack == "retry"
+    assert restarted.data["stats"]["dead_lettered"] == 1
+    assert restarted.dead_letter_path.read_text().count("\n") == 1
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,7 @@ class StateStore:
         self._dead_letter_checked_ids: set[str] = set()
         self._dead_letter_found_ids: set[str] = set()
         self._dead_letter_scan_complete = False
+        self._complete_pending_dead_letter_rotation()
         self.data = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -112,7 +113,13 @@ class StateStore:
             if not isinstance(items, list) or not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= len(items):
                 raise ValueError("invalid bootstrap plan")
             for item in items:
-                if not isinstance(item, dict) or not isinstance(item.get("cursor"), str) or not isinstance(item.get("event"), dict) or not isinstance(item.get("targets"), list):
+                if not isinstance(item, dict) or not isinstance(item.get("cursor"), str):
+                    raise ValueError("invalid bootstrap item")
+                if item.get("action") == "drop":
+                    if set(item) != {"cursor", "action"}:
+                        raise ValueError("invalid bootstrap drop item")
+                    continue
+                if "action" in item or not isinstance(item.get("event"), dict) or not isinstance(item.get("targets"), list):
                     raise ValueError("invalid bootstrap item")
         topic_states = value.get("topic_states")
         if not isinstance(topic_states, dict):
@@ -138,7 +145,6 @@ class StateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(name, self.path)
-            os.chmod(self.path, 0o600)
             self._fsync_parent(self.path.parent)
         finally:
             if os.path.exists(name):
@@ -235,8 +241,13 @@ class StateStore:
         async with self._lock:
             target = self._target(target_index)
             key = "fallback_retries" if fallback else "rich_retries" if rich else "retries"
-            target[key] = int(target.get(key, 0)) + 1
-            await self._persist()
+            previous = int(target.get(key, 0))
+            target[key] = previous + 1
+            try:
+                await self._persist()
+            except BaseException:
+                target[key] = previous
+                raise
 
     async def set_fallback(self, target_index: int) -> None:
         async with self._lock:
@@ -260,14 +271,30 @@ class StateStore:
                 raise
 
     async def terminal(self, target_index: int, status: str) -> None:
+        await self._complete_target(target_index, status, None)
+
+    async def complete_target(self, target_index: int, status: str, cursor: str) -> None:
+        await self._complete_target(target_index, status, cursor)
+
+    async def _complete_target(self, target_index: int, status: str, finish_cursor: str | None) -> None:
         if status not in {"sent", "dead_lettered"}:
             raise ValueError("invalid terminal status")
         async with self._lock:
+            inflight = self.in_flight
+            if finish_cursor is not None and (inflight is None or inflight["cursor"] != finish_cursor):
+                raise RuntimeError("finish cursor does not match in-flight")
+            before = deepcopy(self.data)
             target = self._target(target_index)
             if target["status"] != "pending":
                 raise RuntimeError("target already terminal")
-            target["status"] = status
-            await self._persist()
+            try:
+                target["status"] = status
+                if finish_cursor is not None and inflight is not None and all(item["status"] != "pending" for item in inflight["targets"]):
+                    self._advance(finish_cursor, "forwarded")
+                await self._persist()
+            except BaseException:
+                self.data = before
+                raise
 
     async def finish(self, cursor: str, stat_name: str) -> None:
         if stat_name not in STAT_NAMES:
@@ -326,6 +353,18 @@ class StateStore:
     def _pending_dead_letter_path(self) -> Path:
         return Path(f"{self.dead_letter_path}.pending")
 
+    def _pending_dead_letter_temp_path(self) -> Path:
+        return Path(f"{self.dead_letter_path}.pending.tmp")
+
+    def _dead_letter_rotation_marker_path(self) -> Path:
+        return Path(f"{self.dead_letter_path}.rotation")
+
+    def _dead_letter_rotation_ready_path(self) -> Path:
+        return Path(f"{self.dead_letter_path}.rotation.ready")
+
+    def _dead_letter_rotation_stage_path(self, index: int) -> Path:
+        return Path(f"{self.dead_letter_path}.rotation.{index}")
+
     @staticmethod
     def _validate_regular_path(path: Path) -> bool:
         try:
@@ -349,14 +388,35 @@ class StateStore:
 
     def _write_pending_dead_letter(self, payload: bytes) -> None:
         pending = self._pending_dead_letter_path()
+        temporary = self._pending_dead_letter_temp_path()
         self._validate_regular_path(pending)
+        self._validate_regular_path(temporary)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(pending, flags, 0o600)
+        fd = os.open(temporary, flags, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise RuntimeError("pending dead-letter path is not a regular file")
+                raise RuntimeError("temporary pending dead-letter path is not a regular file")
+            os.fchmod(fd, 0o600)
+            self._write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, pending)
+        os.chmod(pending, 0o600)
+        self._fsync_parent(self.dead_letter_path.parent)
+
+    def _create_dead_letter_rotation_control(self, path: Path, payload: bytes) -> None:
+        if self._validate_regular_path(path):
+            return
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("dead-letter rotation control is not a regular file")
             os.fchmod(fd, 0o600)
             self._write_all(fd, payload)
             os.fsync(fd)
@@ -364,34 +424,157 @@ class StateStore:
             os.close(fd)
         self._fsync_parent(self.dead_letter_path.parent)
 
+    def _read_dead_letter_rotation_backup_count(self, marker: Path) -> int:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(marker, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("dead-letter rotation marker is not a regular file")
+            payload = os.read(fd, 65)
+        finally:
+            os.close(fd)
+        if len(payload) > 64:
+            raise RuntimeError("dead-letter rotation marker is too large")
+        try:
+            backup_count = int(payload.decode("ascii").strip())
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("invalid dead-letter rotation marker") from exc
+        if backup_count < 1:
+            raise RuntimeError("invalid dead-letter rotation backup count")
+        return backup_count
+
+    def _existing_dead_letter_rotation_stages(self) -> dict[int, Path]:
+        parent = self.dead_letter_path.parent
+        if not parent.exists():
+            return {}
+        prefix = f"{self.dead_letter_path.name}.rotation."
+        stages: dict[int, Path] = {}
+        for path in parent.iterdir():
+            suffix = path.name.removeprefix(prefix)
+            if path.name.startswith(prefix) and suffix.isdecimal():
+                self._validate_regular_path(path)
+                stages[int(suffix)] = path
+        return stages
+
     def _complete_pending_dead_letter_rotation(self) -> None:
         pending = self._pending_dead_letter_path()
-        if not self._validate_regular_path(pending):
-            return
-        os.chmod(pending, 0o600)
-        for index in range(1, self.dead_letter_backup_count + 1):
-            self._validate_regular_path(self._rotated_dead_letter_path(index))
-        for index in range(self.dead_letter_backup_count - 1, 0, -1):
-            source = self._rotated_dead_letter_path(index)
-            if self._validate_regular_path(source):
-                os.replace(source, self._rotated_dead_letter_path(index + 1))
-                self._fsync_parent(self.dead_letter_path.parent)
-        if self._validate_regular_path(self.dead_letter_path):
-            os.replace(self.dead_letter_path, self._rotated_dead_letter_path(1))
-            os.chmod(self._rotated_dead_letter_path(1), 0o600)
+        temporary = self._pending_dead_letter_temp_path()
+        marker = self._dead_letter_rotation_marker_path()
+        ready = self._dead_letter_rotation_ready_path()
+        temporary_exists = self._validate_regular_path(temporary)
+        pending_exists = self._validate_regular_path(pending)
+        marker_exists = self._validate_regular_path(marker)
+        ready_exists = self._validate_regular_path(ready)
+        existing_stages = self._existing_dead_letter_rotation_stages()
+        if temporary_exists:
+            if pending_exists or marker_exists or ready_exists or existing_stages:
+                raise RuntimeError("partial pending dead letter overlaps an active rotation")
+            temporary.unlink()
             self._fsync_parent(self.dead_letter_path.parent)
-        os.replace(pending, self.dead_letter_path)
-        os.chmod(self.dead_letter_path, 0o600)
-        self._remove_excess_dead_letter_backups()
+            self._remove_excess_dead_letter_backups()
+            return
+        if not pending_exists and not marker_exists:
+            if ready_exists:
+                if existing_stages or not self._validate_regular_path(self.dead_letter_path):
+                    raise RuntimeError("completed dead-letter rotation has inconsistent files")
+                ready.unlink()
+                self._fsync_parent(self.dead_letter_path.parent)
+                self._remove_excess_dead_letter_backups()
+                return
+            if existing_stages:
+                raise RuntimeError("dead-letter rotation stages exist without pending data or marker")
+            self._remove_excess_dead_letter_backups()
+            return
+        if pending_exists:
+            os.chmod(pending, 0o600)
+        if ready_exists:
+            os.chmod(ready, 0o600)
+        if not marker_exists:
+            if not pending_exists or ready_exists or existing_stages:
+                raise RuntimeError("dead-letter rotation cannot create a plan from inconsistent files")
+            self._create_dead_letter_rotation_control(marker, f"{self.dead_letter_backup_count}\n".encode("ascii"))
+            marker_exists = True
+        if marker_exists:
+            os.chmod(marker, 0o600)
+        transaction_backup_count = self._read_dead_letter_rotation_backup_count(marker)
+        stage_paths = [self._dead_letter_rotation_stage_path(index) for index in range(transaction_backup_count + 1)]
+        unexpected_stages = set(existing_stages) - set(range(transaction_backup_count + 1))
+        if unexpected_stages:
+            raise RuntimeError("dead-letter rotation contains stages outside its persisted plan")
+        for path in stage_paths:
+            if self._validate_regular_path(path):
+                os.chmod(path, 0o600)
+        for index in range(1, transaction_backup_count + 1):
+            backup = self._rotated_dead_letter_path(index)
+            if self._validate_regular_path(backup):
+                os.chmod(backup, 0o600)
+
+        if not ready_exists:
+            if not pending_exists:
+                raise RuntimeError("dead-letter rotation pending data is missing before staging")
+            for index, stage in enumerate(stage_paths):
+                source = self.dead_letter_path if index == 0 else self._rotated_dead_letter_path(index)
+                source_exists = self._validate_regular_path(source)
+                stage_present = self._validate_regular_path(stage)
+                if source_exists and stage_present:
+                    raise RuntimeError("dead-letter rotation source and stage both exist")
+                if index == 0 and not source_exists and not stage_present:
+                    raise RuntimeError("dead-letter rotation lost the active generation before staging")
+                if source_exists:
+                    os.replace(source, stage)
+                    os.chmod(stage, 0o600)
+                    self._fsync_parent(self.dead_letter_path.parent)
+            self._create_dead_letter_rotation_control(ready, b"ready\n")
+            ready_exists = True
+
+        if not ready_exists:
+            raise RuntimeError("dead-letter rotation ready marker is missing")
+        active_stage_exists = self._validate_regular_path(stage_paths[0])
+        active_backup_exists = self._validate_regular_path(self._rotated_dead_letter_path(1))
+        if active_stage_exists == active_backup_exists:
+            raise RuntimeError("dead-letter rotation active generation has an ambiguous commit state")
+        for index in range(transaction_backup_count, -1, -1):
+            stage = stage_paths[index]
+            if not self._validate_regular_path(stage):
+                continue
+            if index == transaction_backup_count:
+                stage.unlink()
+                self._fsync_parent(self.dead_letter_path.parent)
+                continue
+            destination = self._rotated_dead_letter_path(index + 1)
+            os.replace(stage, destination)
+            os.chmod(destination, 0o600)
+            self._fsync_parent(self.dead_letter_path.parent)
+
+        if self._validate_regular_path(pending):
+            os.replace(pending, self.dead_letter_path)
+            os.chmod(self.dead_letter_path, 0o600)
+            self._fsync_parent(self.dead_letter_path.parent)
+        elif not self._validate_regular_path(self.dead_letter_path):
+            raise RuntimeError("dead-letter rotation lost both pending and active data")
+
+        marker.unlink()
         self._fsync_parent(self.dead_letter_path.parent)
+        ready.unlink()
+        self._fsync_parent(self.dead_letter_path.parent)
+        self._remove_excess_dead_letter_backups()
 
     def _remove_excess_dead_letter_backups(self) -> None:
+        if not self.dead_letter_path.parent.exists():
+            return
         prefix = f"{self.dead_letter_path.name}."
         for path in self.dead_letter_path.parent.iterdir():
             suffix = path.name.removeprefix(prefix)
-            if path.name.startswith(prefix) and suffix.isdecimal() and int(suffix) > self.dead_letter_backup_count:
-                self._validate_regular_path(path)
+            if not path.name.startswith(prefix) or not suffix.isdecimal():
+                continue
+            self._validate_regular_path(path)
+            if int(suffix) > self.dead_letter_backup_count:
                 path.unlink()
+                self._fsync_parent(self.dead_letter_path.parent)
+            else:
+                os.chmod(path, 0o600)
 
     @staticmethod
     def _last_byte_is_not_newline(path: Path) -> bool:
@@ -452,7 +635,7 @@ class StateStore:
             oversized_identity: str | None = None
             identity_probe_limit = max(
                 (
-                    len(b'"dead_letter_id":') + len(json.dumps(identity, ensure_ascii=True).encode("ascii"))
+                    len(b'{"dead_letter_id":') + len(json.dumps(identity, ensure_ascii=True).encode("ascii")) + 1
                     for identity in requested
                 ),
                 default=0,
@@ -493,8 +676,8 @@ class StateStore:
     @staticmethod
     def _dead_letter_identity_prefix(record: bytearray, requested: set[str]) -> str | None:
         for identity in requested:
-            field = b'"dead_letter_id":' + json.dumps(identity, ensure_ascii=True).encode("ascii")
-            if field in record:
+            field = b'{"dead_letter_id":' + json.dumps(identity, ensure_ascii=True).encode("ascii") + b','
+            if record.startswith(field):
                 return identity
         return None
 
@@ -507,7 +690,16 @@ class StateStore:
         return f"target:{inflight['cursor']}:{target_index}:{target['chat_id']}:{'' if thread_id is None else thread_id}"
 
     async def dead_letter_target(self, target_index: int, record: dict[str, Any]) -> None:
+        await self._dead_letter_target(target_index, record, None)
+
+    async def dead_letter_target_and_finish(self, target_index: int, record: dict[str, Any], cursor: str) -> None:
+        await self._dead_letter_target(target_index, record, cursor)
+
+    async def _dead_letter_target(self, target_index: int, record: dict[str, Any], finish_cursor: str | None) -> None:
         async with self._lock:
+            inflight = self.in_flight
+            if finish_cursor is not None and (inflight is None or inflight["cursor"] != finish_cursor):
+                raise RuntimeError("finish cursor does not match in-flight")
             target = self._target(target_index)
             if target["status"] != "pending":
                 raise RuntimeError("target already terminal")
@@ -520,6 +712,8 @@ class StateStore:
             try:
                 target["status"] = "dead_lettered"
                 self.data["stats"]["dead_lettered"] += 1
+                if finish_cursor is not None and inflight is not None and all(item["status"] != "pending" for item in inflight["targets"]):
+                    self._advance(finish_cursor, "forwarded")
                 await self._persist()
             except BaseException:
                 self.data = before
@@ -561,8 +755,12 @@ class StateStore:
                 index = bootstrap["next_index"]
                 if index >= len(bootstrap["items"]) or bootstrap["items"][index]["cursor"] != cursor:
                     raise RuntimeError("bootstrap cursor order violation")
+            identity = f"prepare:{cursor}"
             before = deepcopy(self.data)
-            self._append_dead_letter({"cursor": cursor, "event": event, "reason": reason, "phase": "prepare"})
+            if identity not in self._dead_letter_ids({identity}):
+                self._append_dead_letter({"dead_letter_id": identity, "cursor": cursor, "event": event, "reason": reason, "phase": "prepare"})
+                self._dead_letter_checked_ids.add(identity)
+                self._dead_letter_found_ids.add(identity)
             try:
                 self._advance(cursor, "dead_lettered")
                 await self._persist()
@@ -572,11 +770,16 @@ class StateStore:
 
     async def gap_to(self, cursor: str | None) -> None:
         async with self._lock:
-            self.data["in_flight"] = None
-            self.data["bootstrap"] = None
-            self.data["last_acked_cursor"] = cursor
-            self.data["stats"]["gaps"] += 1
-            await self._persist()
+            before = deepcopy(self.data)
+            try:
+                self.data["in_flight"] = None
+                self.data["bootstrap"] = None
+                self.data["last_acked_cursor"] = cursor
+                self.data["stats"]["gaps"] += 1
+                await self._persist()
+            except BaseException:
+                self.data = before
+                raise
 
     async def dead_letter(self, record: dict[str, Any]) -> None:
         async with self._lock:
