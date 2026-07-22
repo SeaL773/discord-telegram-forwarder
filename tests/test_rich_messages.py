@@ -56,10 +56,11 @@ def rich_event() -> dict[str, Any]:
     return value
 
 
-def test_adaptive_compact_and_editorial_triggers():
-    compact = format_event(event("short"), extracted_media_count=1)
-    assert compact.style == "compact" and compact.rich_html is None
-    assert compact.text.startswith("<b>Example User</b> in <b>#signals</b>")
+def test_all_messages_generate_editorial_rich_html():
+    short = format_event(event("short"), extracted_media_count=1)
+    assert short.style == "editorial" and short.rich_html is not None
+    assert short.text.startswith("<b>Example User</b> in <b>#signals</b>")
+    assert short.rich_html.startswith("<h3>#signals</h3><p>short</p>")
 
     reply = event(); reply["message"]["referenced_message"] = {"content": "old"}
     embed = event(); embed["message"]["embeds"] = [{"title": "Card"}]
@@ -67,6 +68,22 @@ def test_adaptive_compact_and_editorial_triggers():
     triggers = [reply, embed, event("```\ncode\n```"), event("x" * 1200), edited]
     assert all(format_event(value).style == "editorial" for value in triggers)
     assert format_event(event(), extracted_media_count=2).style == "editorial"
+
+
+@pytest.mark.asyncio
+async def test_short_message_uses_rich_when_enabled(tmp_path: Path):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    formatted = format_event(event("short"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sender = TgSender("token", client, StateStore(tmp_path / "state", tmp_path / "dead"), 1000, 1000, rich_messages_enabled=True)
+        await sender.send_event(Envelope("short", event("short")), [Target("1")], formatted, [], [])
+
+    assert [request.url.path for request in requests] == ["/bottoken/sendRichMessage"]
 
 
 def test_rich_html_is_escaped_and_bounded():

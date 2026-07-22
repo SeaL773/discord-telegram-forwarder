@@ -3,14 +3,13 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit
 
 from .models import FormattedMessage
 
 
 RICH_HTML_LIMIT = 32768
-EDITORIAL_VISIBLE_THRESHOLD = 1200
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -234,12 +233,6 @@ def _reply_text(message: dict[str, Any]) -> str:
         ref = nested
     text = _first(ref, "content")
     return text[:240] + ("…" if len(text) > 240 else "") if text else ""
-
-
-def _has_reply_reference(message: dict[str, Any]) -> bool:
-    return any(message.get(name) is not None for name in (
-        "referenced_message", "referencedMessage", "reference", "message_reference", "messageReference"
-    ))
 
 
 def _edited(event: dict[str, Any], current: str) -> str:
@@ -466,19 +459,8 @@ def _event_metadata(guild: str, event_type: str) -> str:
     return html.escape(guild) + (f" · {label}" if label else "")
 
 
-def _style(event: dict[str, Any], message: dict[str, Any], content: str, extracted_media_count: int) -> Literal["compact", "editorial"]:
-    event_type = _first(event, "event_type", default="CREATED")
-    return "editorial" if (
-        _has_reply_reference(message)
-        or bool(_embeds(message))
-        or "```" in content
-        or extracted_media_count >= 2
-        or _utf16_units(_sanitize_unicode(content)) >= EDITORIAL_VISIBLE_THRESHOLD
-        or (event_type == "EDITED" and bool(_edit_before(event, content)))
-    ) else "compact"
-
-
 def format_event(event: dict[str, Any], extracted_media_count: int = 0) -> FormattedMessage:
+    _ = extracted_media_count
     message = _dict(event.get("message"))
     event_type = _first(event, "event_type", default="CREATED")
     channel = _first(message, "channel_name", "channelName", default=_first(event, "channel_name", "channelName", default=_first(message, "channel_id", "channelId", default="unknown-channel")))
@@ -495,9 +477,6 @@ def format_event(event: dict[str, Any], extracted_media_count: int = 0) -> Forma
         f"\n<i>{metadata}</i>"
     )
     classic = FormattedMessage(truncate_html(text, 4096), truncate_html(text, 1024))
-    style = _style(event, message, content, extracted_media_count)
-    if style == "compact":
-        return classic
     before = _edit_before(event, content)
     rich_parts = [f"<h3>#{channel_hashtag}</h3>"]
     reply = _reply_text(message)
